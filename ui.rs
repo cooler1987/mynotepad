@@ -7,7 +7,7 @@ use windows_sys::Win32::System::DataExchange::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::System::Memory::*;
 use windows_sys::Win32::UI::Controls::Dialogs::*;
-use windows_sys::Win32::UI::Controls::{BST_CHECKED, EM_SETSEL};
+use windows_sys::Win32::UI::Controls::{BST_CHECKED, EM_SETSEL, SetScrollInfo};
 use windows_sys::Win32::UI::Input::Ime::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::*;
