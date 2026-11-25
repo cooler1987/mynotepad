@@ -1,0 +1,38 @@
+name: Build Windows x64 Portable
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust stable (x86_64-pc-windows-msvc)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust build cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package Portable ZIP
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist_portable
+          Copy-Item "target/x86_64-pc-windows-msvc/release/NotepadLite.exe" "dist_portable/NotepadLite.exe"
+          Compress-Archive -Path "dist_portable/NotepadLite.exe" -DestinationPath "NotepadLite-Portable-win-x64.zip" -Force
+
+      - name: Upload Portable Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NotepadLite-Portable-win-x64
+          path: NotepadLite-Portable-win-x64.zip
