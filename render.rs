@@ -1,4 +1,4 @@
-use std::ptr::{null_mut};
+use std::ptr::null_mut;
 use std::sync::OnceLock;
 
 use windows_sys::Win32::Foundation::*;
@@ -250,15 +250,32 @@ pub fn compute_line_wraps_with_dc(
         return vec![(0, 0)];
     }
 
-    // 若该行包含标题或粗体标记，使用更宽的 Bold 字体测宽，避免换行后右侧被裁切
-    let use_bold = is_md && (line_str.trim_start().starts_with('#') || line_str.contains("**") || line_str.contains("__"));
+    // 仅对超过 2MB 的极端单行走快速列切分，避免单行卡顿
+    if line_str.len() > 2 * 1024 * 1024 {
+        let cols = (max_px / avg_char_w.max(6)).max(12) as usize;
+        let mut segs = Vec::new();
+        let mut s = 0usize;
+        while s < line_str.len() {
+            let e = line_str[s..]
+                .char_indices()
+                .nth(cols)
+                .map(|(i, _)| s + i)
+                .unwrap_or(line_str.len());
+            segs.push((s, e));
+            s = e;
+        }
+        return segs;
+    }
+
+    let use_bold = is_md
+        && (line_str.trim_start().starts_with('#') || line_str.contains("**") || line_str.contains("__"));
     unsafe {
         SelectObject(hdc, if use_bold { font_bold } else { font_regular } as _);
     }
 
     let mut segs = Vec::new();
     let mut seg_start = 0usize;
-    let base_chars = ((max_px / (avg_char_w / 2).max(3)) as usize + 48).max(64);
+    let base_chars = ((max_px / (avg_char_w * 3 / 4).max(4)) as usize + 32).clamp(64, 240);
 
     while seg_start < line_str.len() {
         let rem = &line_str[seg_start..];
@@ -279,7 +296,11 @@ pub fn compute_line_wraps_with_dc(
                 GetTextExtentExPointW(hdc, w.as_ptr(), u16_len, max_px, &mut fit, null_mut(), &mut sz);
             }
             if fit == u16_len && chunk_end < rem.len() {
-                chunk_chars *= 2;
+                chunk_chars = (chunk_chars * 2).min(4096);
+                if chunk_chars == 4096 && chunk_end < rem.len() {
+                    // 极窄字符超长行继续扩大
+                    chunk_chars = rem.len();
+                }
                 continue;
             }
             break (ch_slice, fit.max(0) as usize, u16_len as usize, map);
@@ -473,7 +494,10 @@ fn paint_outline_panel(state: &AppState, mem_dc: HDC, theme: Theme, left: i32, r
     }
 }
 
-pub fn paint_editor(state: &AppState, hdc_win: HDC) {
+pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
+    // 仅在绘制前对视口可见行做像素级精确折行（惰性按需缓存）
+    state.ensure_viewport_wraps();
+
     let w = state.client_w.max(1);
     let h = state.client_h.max(1);
     let edit_r = state.editor_right();
@@ -518,6 +542,10 @@ pub fn paint_editor(state: &AppState, hdc_win: HDC) {
         let hr_pen = CreatePen(PS_SOLID as i32, 1, theme.ws_fg);
 
         let mut last_drawn_logical = usize::MAX;
+        let mut cached_hl_line = usize::MAX;
+        let mut cached_tokens: Vec<(usize, usize, TokenKind)> = Vec::new();
+        let mut cached_attr = LineAttr::default();
+
         let text_left = state.gutter_w + 8 - state.scroll_x;
         let active_lang = if state.doc.large_mode { Lang::Plain } else { state.doc.lang };
 
@@ -531,15 +559,21 @@ pub fn paint_editor(state: &AppState, hdc_win: HDC) {
                 break;
             }
 
-            let line_state = state.doc.line_states.get(seg.line).copied().unwrap_or(LineState::Normal);
             let full_line = state.doc.line_str(seg.line);
-            let (tokens, line_attr) = if full_line.len() <= 8192 {
-                highlight_line_with_state(active_lang, full_line, line_state)
-            } else {
-                (Vec::new(), LineAttr::default())
-            };
+            if seg.line != cached_hl_line {
+                cached_hl_line = seg.line;
+                if full_line.len() <= 8192 {
+                    let line_state = state.doc.line_states.get(seg.line).copied().unwrap_or(LineState::Normal);
+                    let (t, a) = highlight_line_with_state(active_lang, full_line, line_state);
+                    cached_tokens = t;
+                    cached_attr = a;
+                } else {
+                    cached_tokens.clear();
+                    cached_attr = LineAttr::default();
+                }
+            }
 
-            if line_attr.is_code_block {
+            if cached_attr.is_code_block {
                 let cb_rc = RECT { left: state.gutter_w, top: y, right: edit_r, bottom: y + state.line_h };
                 FillRect(mem_dc, &cb_rc, code_blk_br);
             }
@@ -547,7 +581,7 @@ pub fn paint_editor(state: &AppState, hdc_win: HDC) {
                 let row_rc = RECT { left: state.gutter_w, top: y, right: edit_r, bottom: y + state.line_h };
                 FillRect(mem_dc, &row_rc, cur_line_br);
             }
-            if line_attr.is_quote {
+            if cached_attr.is_quote {
                 let q_rc = RECT { left: state.gutter_w + 2, top: y + 1, right: state.gutter_w + 5, bottom: y + state.line_h - 1 };
                 FillRect(mem_dc, &q_rc, quote_bar_br);
             }
@@ -563,7 +597,7 @@ pub fn paint_editor(state: &AppState, hdc_win: HDC) {
 
             SelectClipRgn(mem_dc, clip_rgn);
 
-            if line_attr.is_hr && seg.b_start == 0 {
+            if cached_attr.is_hr && seg.b_start == 0 {
                 let old_pen = SelectObject(mem_dc, hr_pen as _);
                 let hy = y + state.line_h / 2;
                 MoveToEx(mem_dc, state.gutter_w + 8, hy, null_mut());
@@ -666,7 +700,7 @@ pub fn paint_editor(state: &AppState, hdc_win: HDC) {
             };
 
             let seg_end_rel = seg.b_start + draw_slice.len();
-            for (ts, te, kind) in tokens {
+            for &(ts, te, kind) in &cached_tokens {
                 if te <= seg.b_start || ts >= seg_end_rel {
                     continue;
                 }
@@ -686,7 +720,7 @@ pub fn paint_editor(state: &AppState, hdc_win: HDC) {
                     TokenKind::Bold => (theme.bold_fg, state.hfont_bold, false),
                     TokenKind::Italic => (theme.italic_fg, state.hfont_italic, false),
                     TokenKind::Strike => (theme.strike_fg, state.hfont_strike, false),
-                    TokenKind::InlineCode => (theme.code_fg, state.hfont_regular, !line_attr.is_code_block),
+                    TokenKind::InlineCode => (theme.code_fg, state.hfont_regular, !cached_attr.is_code_block),
                     TokenKind::AlertTag => (theme.alert_fg, state.hfont_bold, true),
                     TokenKind::TaskDone => (theme.task_done_fg, state.hfont_bold, false),
                     TokenKind::TaskTodo => (theme.task_todo_fg, state.hfont_bold, false),
@@ -732,7 +766,6 @@ pub fn paint_editor(state: &AppState, hdc_win: HDC) {
             paint_outline_panel(state, mem_dc, theme, edit_r, w, edit_b);
         }
 
-        // 底部紧凑状态栏
         let sb_top = h - STATUS_BAR_HEIGHT;
         let sb_br = CreateSolidBrush(theme.status_bg);
         let sb_rc = RECT { left: 0, top: sb_top, right: w, bottom: h };
