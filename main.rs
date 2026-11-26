@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod engine;
+mod render;
 mod ui;
 
 use std::path::PathBuf;
@@ -14,9 +15,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use engine::{
     init_logger, load_config, log_msg, show_fatal_box, to_wide, Document, OutlineState, SearchState,
 };
+use render::apply_titlebar_theme;
 use ui::{create_find_panel, main_wnd_proc, AppState};
 
-// 菜单命令 ID（与 ui.rs 共享）
+// 菜单命令 ID
 pub const IDM_FILE_NEW: usize = 1001;
 pub const IDM_FILE_OPEN: usize = 1002;
 pub const IDM_FILE_SAVE: usize = 1003;
@@ -37,6 +39,7 @@ pub const IDM_EDIT_MOVE_DOWN: usize = 2010;
 pub const IDM_EDIT_COMMENT: usize = 2011;
 pub const IDM_EDIT_UPPER: usize = 2012;
 pub const IDM_EDIT_LOWER: usize = 2013;
+pub const IDM_EDIT_DELETE: usize = 2014;
 
 pub const IDM_SEARCH_FIND: usize = 3001;
 pub const IDM_SEARCH_REPLACE: usize = 3002;
@@ -50,11 +53,14 @@ pub const IDM_VIEW_WHITESPACE: usize = 4003;
 pub const IDM_VIEW_OUTLINE: usize = 4004;
 pub const IDM_VIEW_OUTLINE_REFRESH: usize = 4005;
 pub const IDM_VIEW_FONT: usize = 4006;
-pub const IDM_VIEW_THEME: usize = 4007;
-pub const IDM_VIEW_TOPMOST: usize = 4008;
-pub const IDM_VIEW_ZOOM_IN: usize = 4009;
-pub const IDM_VIEW_ZOOM_OUT: usize = 4010;
-pub const IDM_VIEW_ZOOM_RESET: usize = 4011;
+pub const IDM_VIEW_THEME_DARK: usize = 4007;
+pub const IDM_VIEW_THEME_LIGHT: usize = 4008;
+pub const IDM_VIEW_TOPMOST: usize = 4009;
+pub const IDM_VIEW_ZOOM_IN: usize = 4010;
+pub const IDM_VIEW_ZOOM_OUT: usize = 4011;
+pub const IDM_VIEW_ZOOM_RESET: usize = 4012;
+pub const IDM_OUTLINE_EXPAND_ALL: usize = 4020;
+pub const IDM_OUTLINE_COLLAPSE_ALL: usize = 4021;
 
 pub const IDM_EOL_CRLF: usize = 5201;
 pub const IDM_EOL_LF: usize = 5202;
@@ -88,6 +94,7 @@ pub fn build_main_menu() -> HMENU {
         add(m_edit, IDM_EDIT_CUT, "剪切(&T)\tCtrl+X");
         add(m_edit, IDM_EDIT_COPY, "复制(&C)\tCtrl+C");
         add(m_edit, IDM_EDIT_PASTE, "粘贴(&P)\tCtrl+V");
+        add(m_edit, IDM_EDIT_DELETE, "删除(&D)\tDel");
         add(m_edit, IDM_EDIT_SELECT_ALL, "全选(&A)\tCtrl+A");
         AppendMenuW(m_edit, MF_SEPARATOR, 0, null());
         add(m_edit, IDM_EDIT_DUP_LINE, "复制当前行\tCtrl+D");
@@ -117,8 +124,9 @@ pub fn build_main_menu() -> HMENU {
         add(m_view, IDM_VIEW_OUTLINE, "Markdown 大纲栏(&O)\tCtrl+Shift+O");
         add(m_view, IDM_VIEW_OUTLINE_REFRESH, "刷新大纲目录(&E)");
         AppendMenuW(m_view, MF_SEPARATOR, 0, null());
+        add(m_view, IDM_VIEW_THEME_DARK, "深色主题 (Dark)");
+        add(m_view, IDM_VIEW_THEME_LIGHT, "浅色主题 (Light)");
         add(m_view, IDM_VIEW_FONT, "字体与字号设置(&F)...");
-        add(m_view, IDM_VIEW_THEME, "切换深色 / 浅色主题(&T)");
         add(m_view, IDM_VIEW_TOPMOST, "窗口置顶(&A)");
         AppendMenuW(m_view, MF_SEPARATOR, 0, null());
         add(m_view, IDM_VIEW_ZOOM_IN, "放大字体\tCtrl++");
@@ -223,6 +231,7 @@ fn main() {
             ui_font_name.as_ptr(),
         );
 
+        let dark = cfg.dark_theme;
         let mut state = Box::new(AppState {
             hwnd,
             hfont_regular: null_mut(),
@@ -231,6 +240,8 @@ fn main() {
             hfont_strike: null_mut(),
             hfont_ui,
             hfont_ui_bold,
+            find_bg_brush: null_mut(),
+            find_edit_brush: null_mut(),
             doc: Document::new_empty(),
             cfg,
             search: SearchState::new(),
@@ -242,6 +253,7 @@ fn main() {
             gutter_w: 14,
             scroll_y: 0,
             scroll_x: 0,
+            last_wrap_px: 0,
             line_wraps: Vec::new(),
             visual_prefix: vec![0, 1],
             dragging: false,
@@ -261,7 +273,9 @@ fn main() {
             goto_edit: null_mut(),
         });
 
+        apply_titlebar_theme(hwnd, dark);
         state.recreate_fonts();
+        state.rebuild_theme_brushes();
         create_find_panel(&mut state, hinst);
 
         let state_ptr: *mut AppState = Box::into_raw(state);
