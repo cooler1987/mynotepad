@@ -15,6 +15,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, CW_USEDEFAULT, MB
 
 pub const LARGE_FILE_BYTES: usize = 20 * 1024 * 1024; // >20MB 触发大文件自动降级策略
 pub const MAX_MATCH_HIGHLIGHTS: usize = 50_000;
+const CURRENT_CONFIG_VERSION: u32 = 2;
 
 pub fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
@@ -92,6 +93,7 @@ pub fn show_fatal_box(title: &str, msg: &str) {
 #[derive(Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct AppConfig {
+    pub config_version: u32,
     pub win_x: i32,
     pub win_y: i32,
     pub win_w: i32,
@@ -113,6 +115,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            config_version: CURRENT_CONFIG_VERSION,
             win_x: CW_USEDEFAULT,
             win_y: CW_USEDEFAULT,
             win_w: 1120,
@@ -145,10 +148,21 @@ pub fn load_config() -> AppConfig {
         return cfg;
     }
     match fs::read_to_string(&path) {
-        Ok(s) => serde_json::from_str::<AppConfig>(&s).unwrap_or_else(|e| {
-            log_msg("WARN", &format!("config.json parse error, using default: {}", e));
-            AppConfig::default()
-        }),
+        Ok(s) => {
+            let mut cfg = serde_json::from_str::<AppConfig>(&s).unwrap_or_else(|e| {
+                log_msg("WARN", &format!("config.json parse error, using default: {}", e));
+                AppConfig::default()
+            });
+            // 自动将旧版 config.json 升级为新版默认设置（默认自动换行、默认关闭行号/大纲）
+            if cfg.config_version < CURRENT_CONFIG_VERSION {
+                cfg.config_version = CURRENT_CONFIG_VERSION;
+                cfg.word_wrap = true;
+                cfg.show_line_numbers = false;
+                cfg.outline_visible = false;
+                save_config(&cfg);
+            }
+            cfg
+        }
         Err(e) => {
             log_msg("WARN", &format!("config.json read error: {}", e));
             AppConfig::default()
@@ -395,7 +409,7 @@ pub struct Document {
     pub text: String,
     pub line_starts: Vec<usize>,
     pub line_states: Vec<LineState>,
-    pub wrap_patches: Vec<(usize, usize, usize)>, // (start_line, old_count, new_count)
+    pub wrap_patches: Vec<(usize, usize, usize)>,
     pub cursors: Vec<Cursor>,
     undo_stack: VecDeque<UndoEntry>,
     redo_stack: VecDeque<UndoEntry>,
@@ -428,6 +442,18 @@ impl Document {
             total_chars: 0,
             lang: Lang::Markdown,
         }
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    pub fn has_any_selection(&self) -> bool {
+        self.cursors.iter().any(|c| c.has_selection())
     }
 
     pub fn rebuild_line_index(&mut self) {
@@ -1085,7 +1111,6 @@ pub fn detect_lang(path: Option<&Path>) -> Lang {
         "js" | "jsx" | "ts" | "tsx" | "mjs" => Lang::JsTs,
         "sh" | "bash" | "bat" | "cmd" | "ps1" => Lang::Shell,
         "ini" | "toml" | "cfg" | "conf" | "yaml" | "yml" => Lang::Ini,
-        // 默认未命名、纯文本、Markdown 统一按 Markdown + GFM 解析
         _ => Lang::Markdown,
     }
 }
@@ -1339,13 +1364,11 @@ fn scan_inline_md(
     while i < to {
         let b = bytes[i];
 
-        // 转义字符
         if b == b'\\' && i + 1 < to {
             i += 2;
             continue;
         }
 
-        // 行内代码 `...`
         if b == b'`' {
             let mut ticks = 0usize;
             while i + ticks < to && bytes[i + ticks] == b'`' {
@@ -1379,7 +1402,6 @@ fn scan_inline_md(
             continue;
         }
 
-        // GFM 表格竖线
         if base_kind.is_none() && b == b'|' {
             flush_plain(plain_start, i, out);
             out.push((i, i + 1, TokenKind::Accent));
@@ -1388,8 +1410,7 @@ fn scan_inline_md(
             continue;
         }
 
-        // 图片与链接 ![alt](url) / [text](url)
-        if b == b'!' && i + 1 < to && bytes[i + 1] == b'[' || b == b'[' {
+        if (b == b'!' && i + 1 < to && bytes[i + 1] == b'[') || b == b'[' {
             let lb = if b == b'!' { i + 1 } else { i };
             if let Some(rb_rel) = line[lb + 1..to].find(']') {
                 let rb = lb + 1 + rb_rel;
@@ -1407,7 +1428,6 @@ fn scan_inline_md(
             }
         }
 
-        // 自动链接 <https://...>
         if b == b'<' {
             if let Some(gt_rel) = line[i + 1..to].find('>') {
                 let inner = &line[i + 1..i + 1 + gt_rel];
@@ -1422,7 +1442,6 @@ fn scan_inline_md(
             }
         }
 
-        // GFM 删除线 ~~...~~
         if b == b'~' && i + 1 < to && bytes[i + 1] == b'~' {
             if let Some(end_rel) = line[i + 2..to].find("~~") {
                 if end_rel > 0 {
@@ -1436,7 +1455,6 @@ fn scan_inline_md(
             }
         }
 
-        // 粗体 **...** 或 __...__
         if (b == b'*' || b == b'_') && i + 1 < to && bytes[i + 1] == b {
             let pat = if b == b'*' { "**" } else { "__" };
             let word_ok = b == b'*' || i == from || !is_ident_char(bytes[i - 1]);
@@ -1454,7 +1472,6 @@ fn scan_inline_md(
             }
         }
 
-        // 斜体 *...* 或 _..._
         if b == b'*' || b == b'_' {
             let word_ok = b == b'*' || i == from || !is_ident_char(bytes[i - 1]);
             if word_ok && i + 1 < to && bytes[i + 1] != b' ' && bytes[i + 1] != b {
@@ -1483,7 +1500,6 @@ fn scan_inline_md(
             }
         }
 
-        // 跳过 UTF-8 多字节字符的后续字节
         i += 1;
         while i < to && !line.is_char_boundary(i) {
             i += 1;
@@ -1510,7 +1526,6 @@ pub fn highlight_line_with_state(
     let len = line.len();
     let bytes = line.as_bytes();
 
-    // 1. 处于跨行围栏代码块内
     if let LineState::FencedCode { fence_ch, fence_len, inner_lang } = state {
         attr.is_code_block = true;
         if is_fence_close(line, fence_ch, fence_len) {
@@ -1521,7 +1536,6 @@ pub fn highlight_line_with_state(
         return (out, attr);
     }
 
-    // 2. 开启围栏代码块 ```lang / ~~~
     if parse_fence_open(line).is_some() {
         attr.is_code_block = true;
         let ws = len - line.trim_start().len();
@@ -1539,27 +1553,24 @@ pub fn highlight_line_with_state(
     let ws = len - line.trim_start().len();
     let rest = &line[ws..];
 
-    // 3. 缩进代码块（4空格或Tab开头且非空）
     if (ws >= 4 || bytes.first() == Some(&b'\t')) && !rest.is_empty() {
         attr.is_code_block = true;
         out.push((0, len, TokenKind::InlineCode));
         return (out, attr);
     }
 
-    // 4. 分割线 --- / *** / ___
     if ws <= 3 && is_horizontal_rule(rest) {
         attr.is_hr = true;
         out.push((ws, len, TokenKind::Comment));
         return (out, attr);
     }
 
-    // 5. ATX 标题 (# ~ ######)
     if ws <= 3 && rest.starts_with('#') {
         let mut hashes = 0usize;
         while hashes < rest.len() && rest.as_bytes()[hashes] == b'#' {
             hashes += 1;
         }
-        if hashes >= 1 && hashes <= 6 && (hashes == rest.len() || rest.as_bytes()[hashes] == b' ' || rest.as_bytes()[hashes] == b'\t') {
+        if (1..=6).contains(&hashes) && (hashes == rest.len() || rest.as_bytes()[hashes] == b' ' || rest.as_bytes()[hashes] == b'\t') {
             let h_kind = if hashes <= 2 { TokenKind::Heading1 } else { TokenKind::Heading2 };
             out.push((ws, ws + hashes, TokenKind::Accent));
             if ws + hashes < len {
@@ -1569,7 +1580,6 @@ pub fn highlight_line_with_state(
         }
     }
 
-    // 6. 引用块 & GFM Alerts (> [!NOTE] 等)
     if ws <= 3 && rest.starts_with('>') {
         attr.is_quote = true;
         let mut q_end = ws;
@@ -1593,7 +1603,6 @@ pub fn highlight_line_with_state(
         return (out, attr);
     }
 
-    // 7. GFM 表格分隔行 / 数据行
     if is_gfm_table_delimiter(line) {
         attr.is_table = true;
         out.push((ws, len, TokenKind::Accent));
@@ -1603,7 +1612,6 @@ pub fn highlight_line_with_state(
         attr.is_table = true;
     }
 
-    // 8. 任务列表 & 无序/有序列表
     let mut content_start = ws;
     if ws <= 3 {
         let rb = rest.as_bytes();
@@ -1632,7 +1640,6 @@ pub fn highlight_line_with_state(
         }
     }
 
-    // 9. 行内 Markdown 元素扫描
     scan_inline_md(line, content_start, len, None, &mut out);
     (out, attr)
 }
@@ -1667,7 +1674,6 @@ impl OutlineState {
     }
 
     pub fn refresh_from_doc(&mut self, doc: &Document) {
-        // 记录之前的折叠状态（按 line + title 尽量保留）
         let prev_collapsed: Vec<(u8, String)> = self
             .nodes
             .iter()
@@ -1718,7 +1724,6 @@ impl OutlineState {
                 }
             }
 
-            // 支持 Setext 标题 (=== / ---)
             if l > 0 && ws <= 3 {
                 let t = trimmed.trim_end();
                 if t.len() >= 3 && (t.bytes().all(|b| b == b'=') || t.bytes().all(|b| b == b'-')) {
