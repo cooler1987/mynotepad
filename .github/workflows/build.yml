@@ -24,15 +24,15 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target x86_64-pc-windows-msvc
 
-      - name: Package Portable ZIP
+      - name: Stage Portable Binary
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist_portable
           Copy-Item "target/x86_64-pc-windows-msvc/release/NotepadLite.exe" "dist_portable/NotepadLite.exe"
-          Compress-Archive -Path "dist_portable/NotepadLite.exe" -DestinationPath "NotepadLite-Portable-win-x64.zip" -Force
 
       - name: Upload Portable Artifact
         uses: actions/upload-artifact@v4
         with:
           name: NotepadLite-Portable-win-x64
-          path: NotepadLite-Portable-win-x64.zip
+          path: dist_portable/
+          include-hidden-files: false
