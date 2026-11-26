@@ -4,19 +4,26 @@ mod engine;
 mod render;
 mod ui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
+use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
+use windows_sys::Win32::System::DataExchange::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Memory::*;
+use windows_sys::Win32::UI::Controls::Dialogs::*;
+use windows_sys::Win32::UI::Controls::{BST_CHECKED, EM_SETSEL};
 use windows_sys::Win32::UI::HiDpi::*;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_TAB};
 use windows_sys::Win32::UI::Shell::DragAcceptFiles;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use engine::{
-    init_logger, load_config, log_msg, show_fatal_box, to_wide, Document, OutlineState, SearchState,
+    from_wide_slice, init_logger, load_config, log_msg, normalize_newlines_fast, save_config,
+    show_fatal_box, to_wide, Cursor, Document, OutlineState, SearchState,
 };
-use render::apply_titlebar_theme;
-use ui::{create_find_panel, main_wnd_proc, AppState};
+use render::{apply_titlebar_theme, get_theme};
+use ui::{main_wnd_proc, AppState};
 
 // 菜单命令 ID
 pub const IDM_FILE_NEW: usize = 1001;
@@ -25,6 +32,8 @@ pub const IDM_FILE_SAVE: usize = 1003;
 pub const IDM_FILE_SAVEAS: usize = 1004;
 pub const IDM_FILE_RELOAD: usize = 1005;
 pub const IDM_FILE_EXIT: usize = 1006;
+pub const IDM_FILE_RECENT_BASE: usize = 1100;
+pub const IDM_FILE_RECENT_CLEAR: usize = 1120;
 
 pub const IDM_EDIT_UNDO: usize = 2001;
 pub const IDM_EDIT_REDO: usize = 2002;
@@ -65,7 +74,565 @@ pub const IDM_OUTLINE_COLLAPSE_ALL: usize = 4021;
 pub const IDM_EOL_CRLF: usize = 5201;
 pub const IDM_EOL_LF: usize = 5202;
 
-pub fn build_main_menu() -> HMENU {
+pub const FIND_PANEL_W: i32 = 430;
+pub const FIND_PANEL_H: i32 = 108;
+pub const CF_UNICODETEXT_ID: u32 = 13;
+const SS_CENTER: u32 = 1;
+
+const IDC_FIND_EDIT: i32 = 6001;
+const IDC_REPLACE_EDIT: i32 = 6002;
+const IDC_CHK_CASE: i32 = 6003;
+const IDC_CHK_WORD: i32 = 6004;
+const IDC_CHK_REGEX: i32 = 6005;
+const IDC_BTN_PREV: i32 = 6006;
+const IDC_BTN_NEXT: i32 = 6007;
+pub const IDC_BTN_REPLACE: i32 = 6008;
+pub const IDC_BTN_REPLACE_ALL: i32 = 6009;
+const IDC_BTN_CLOSE: i32 = 6010;
+const IDC_LBL_COUNT: i32 = 6011;
+
+const IDC_GOTO_EDIT: i32 = 6101;
+const IDC_GOTO_OK: i32 = 6102;
+const IDC_GOTO_CANCEL: i32 = 6103;
+
+#[inline]
+fn lo_word(v: usize) -> u16 {
+    (v & 0xFFFF) as u16
+}
+#[inline]
+fn hi_word(v: usize) -> u16 {
+    ((v >> 16) & 0xFFFF) as u16
+}
+#[inline]
+fn is_key_down(vk: u16) -> bool {
+    unsafe { (GetKeyState(vk as i32) as u16 & 0x8000) != 0 }
+}
+
+// ============================================================================
+// 1. 剪贴板与系统文件/字体对话框
+// ============================================================================
+
+pub fn clipboard_copy(hwnd: HWND, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let wide = to_wide(text);
+    unsafe {
+        if OpenClipboard(hwnd) == 0 {
+            return;
+        }
+        EmptyClipboard();
+        let bytes = wide.len() * 2;
+        let hmem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if !hmem.is_null() {
+            let ptr = GlobalLock(hmem) as *mut u16;
+            if !ptr.is_null() {
+                std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
+                GlobalUnlock(hmem);
+                SetClipboardData(CF_UNICODETEXT_ID, hmem);
+            }
+        }
+        CloseClipboard();
+    }
+}
+
+pub fn clipboard_paste(hwnd: HWND) -> Option<String> {
+    unsafe {
+        if OpenClipboard(hwnd) == 0 {
+            return None;
+        }
+        let hdata = GetClipboardData(CF_UNICODETEXT_ID);
+        let mut res = None;
+        if !hdata.is_null() {
+            let ptr = GlobalLock(hdata) as *const u16;
+            if !ptr.is_null() {
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 {
+                    len += 1;
+                }
+                let slice = std::slice::from_raw_parts(ptr, len);
+                let (norm, _) = normalize_newlines_fast(&String::from_utf16_lossy(slice));
+                res = Some(norm);
+                GlobalUnlock(hdata);
+            }
+        }
+        CloseClipboard();
+        res
+    }
+}
+
+pub fn dialog_open_file(hwnd: HWND) -> Option<PathBuf> {
+    let mut buf = vec![0u16; 4096];
+    let filter: Vec<u16> = "Markdown 与文本 (*.md;*.markdown;*.txt;*.log)\0*.md;*.markdown;*.txt;*.log\0所有文件 (*.*)\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    unsafe {
+        let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+        ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+        ofn.hwndOwner = hwnd;
+        ofn.lpstrFilter = filter.as_ptr();
+        ofn.lpstrFile = buf.as_mut_ptr();
+        ofn.nMaxFile = buf.len() as u32;
+        ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+        if GetOpenFileNameW(&mut ofn) != 0 {
+            return Some(PathBuf::from(from_wide_slice(&buf)));
+        }
+    }
+    None
+}
+
+pub fn dialog_save_file(hwnd: HWND, current_path: Option<&Path>) -> Option<PathBuf> {
+    let mut buf = vec![0u16; 4096];
+    if let Some(p) = current_path.and_then(|cp| cp.file_name()) {
+        let w = to_wide(&p.to_string_lossy());
+        let n = w.len().min(buf.len());
+        buf[..n].copy_from_slice(&w[..n]);
+    }
+    let is_txt = current_path
+        .and_then(|p| p.extension())
+        .and_then(|e| e.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("txt"));
+    let def_ext = to_wide(if is_txt { "txt" } else { "md" });
+    let filter: Vec<u16> = "Markdown 文档 (*.md)\0*.md\0文本文档 (*.txt)\0*.txt\0所有文件 (*.*)\0*.*\0\0"
+        .encode_utf16()
+        .collect();
+    unsafe {
+        let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+        ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+        ofn.hwndOwner = hwnd;
+        ofn.lpstrFilter = filter.as_ptr();
+        ofn.nFilterIndex = if is_txt { 2 } else { 1 };
+        ofn.lpstrFile = buf.as_mut_ptr();
+        ofn.nMaxFile = buf.len() as u32;
+        ofn.lpstrDefExt = def_ext.as_ptr();
+        ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
+        if GetSaveFileNameW(&mut ofn) != 0 {
+            let mut path = PathBuf::from(from_wide_slice(&buf));
+            if path.extension().is_none() {
+                match ofn.nFilterIndex {
+                    1 => {
+                        path.set_extension("md");
+                    }
+                    2 => {
+                        path.set_extension("txt");
+                    }
+                    _ => {}
+                }
+            }
+            return Some(path);
+        }
+    }
+    None
+}
+
+pub fn dialog_choose_font(state: &mut AppState) {
+    unsafe {
+        let mut lf: LOGFONTW = std::mem::zeroed();
+        lf.lfHeight = -state.cfg.font_size;
+        lf.lfWeight = FW_NORMAL as i32;
+        let wname = to_wide(&state.cfg.font_name);
+        let n = wname.len().min(32);
+        lf.lfFaceName[..n].copy_from_slice(&wname[..n]);
+
+        let mut cf: CHOOSEFONTW = std::mem::zeroed();
+        cf.lStructSize = std::mem::size_of::<CHOOSEFONTW>() as u32;
+        cf.hwndOwner = state.hwnd;
+        cf.lpLogFont = &mut lf;
+        cf.Flags = CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT;
+        if ChooseFontW(&mut cf) != 0 {
+            state.cfg.font_name = from_wide_slice(&lf.lfFaceName);
+            state.cfg.font_size = (cf.iPointSize / 10).max(8);
+            state.cfg.zoom_pct = 100;
+            state.recreate_fonts();
+            save_config(&state.cfg);
+            state.invalidate();
+        }
+    }
+}
+
+// ============================================================================
+// 2. 主题化悬浮查找替换面板 & 转到指定行弹窗
+// ============================================================================
+
+fn get_win_text(hwnd: HWND) -> String {
+    unsafe {
+        let len = GetWindowTextLengthW(hwnd);
+        if len <= 0 {
+            return String::new();
+        }
+        let mut buf = vec![0u16; (len + 1) as usize];
+        GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        from_wide_slice(&buf)
+    }
+}
+
+unsafe extern "system" fn edit_box_subclass(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
+    let panel = GetParent(hwnd);
+    let main_hwnd = GetParent(panel);
+    let state_ptr = GetWindowLongPtrW(main_hwnd, GWLP_USERDATA) as *mut AppState;
+    let orig = if !state_ptr.is_null() {
+        let st = &*state_ptr;
+        if hwnd == st.find_edit { st.orig_find_edit_proc } else { st.orig_rep_edit_proc }
+    } else {
+        0
+    };
+
+    if msg == WM_KEYDOWN && !state_ptr.is_null() {
+        let st = &mut *state_ptr;
+        if wp == VK_ESCAPE as usize {
+            st.hide_find_panel();
+            return 0;
+        }
+        if wp == VK_RETURN as usize {
+            let forward = !is_key_down(VK_SHIFT);
+            if let Some((ms, me)) = st.search.step(forward) {
+                st.doc.cursors = vec![Cursor { anchor: ms, head: me }];
+                st.ensure_caret_visible();
+                st.refresh_search_ui();
+            }
+            return 0;
+        }
+        if wp == VK_TAB as usize && st.search.show_replace {
+            let target = if hwnd == st.find_edit { st.replace_edit } else { st.find_edit };
+            SetFocus(target);
+            SendMessageW(target, EM_SETSEL as u32, 0, -1);
+            return 0;
+        }
+    }
+    let prev: WNDPROC = std::mem::transmute(orig);
+    CallWindowProcW(prev, hwnd, msg, wp, lp)
+}
+
+unsafe extern "system" fn find_panel_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
+    let main_hwnd = GetParent(hwnd);
+    let state_ptr = GetWindowLongPtrW(main_hwnd, GWLP_USERDATA) as *mut AppState;
+    if !state_ptr.is_null() {
+        let st = &mut *state_ptr;
+        let theme = get_theme(st.cfg.dark_theme);
+        match msg {
+            WM_ERASEBKGND => {
+                let hdc = wp as HDC;
+                let mut rc: RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut rc);
+                FillRect(hdc, &rc, st.find_bg_brush);
+                return 1;
+            }
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+                let hdc = wp as HDC;
+                SetTextColor(hdc, theme.outline_fg);
+                SetBkColor(hdc, theme.outline_hdr_bg);
+                return st.find_bg_brush as isize;
+            }
+            WM_CTLCOLOREDIT => {
+                let hdc = wp as HDC;
+                SetTextColor(hdc, theme.text_fg);
+                SetBkColor(hdc, theme.bg);
+                return st.find_edit_brush as isize;
+            }
+            WM_COMMAND => {
+                let id = lo_word(wp) as i32;
+                let code = hi_word(wp) as u32;
+                match id {
+                    IDC_FIND_EDIT if code == EN_CHANGE as u32 => {
+                        st.search.query = get_win_text(st.find_edit);
+                        st.refresh_search_ui();
+                        return 0;
+                    }
+                    IDC_REPLACE_EDIT if code == EN_CHANGE as u32 => {
+                        st.search.replace_with = get_win_text(st.replace_edit);
+                        return 0;
+                    }
+                    IDC_CHK_CASE | IDC_CHK_WORD | IDC_CHK_REGEX => {
+                        st.search.case_sensitive =
+                            SendMessageW(st.chk_case, BM_GETCHECK as u32, 0, 0) == BST_CHECKED as isize;
+                        st.search.whole_word =
+                            SendMessageW(st.chk_word, BM_GETCHECK as u32, 0, 0) == BST_CHECKED as isize;
+                        st.search.use_regex =
+                            SendMessageW(st.chk_regex, BM_GETCHECK as u32, 0, 0) == BST_CHECKED as isize;
+                        st.refresh_search_ui();
+                        return 0;
+                    }
+                    IDC_BTN_NEXT | IDC_BTN_PREV => {
+                        if let Some((ms, me)) = st.search.step(id == IDC_BTN_NEXT) {
+                            st.doc.cursors = vec![Cursor { anchor: ms, head: me }];
+                            st.ensure_caret_visible();
+                            st.refresh_search_ui();
+                        }
+                        return 0;
+                    }
+                    IDC_BTN_REPLACE => {
+                        if let Some(idx) = st.search.current_idx {
+                            if let Some(&(ms, me)) = st.search.matches.get(idx) {
+                                let rep = st.search.replace_with.clone();
+                                let rlen = rep.len();
+                                st.doc.apply_edits(vec![(ms, me, rep)], Some(vec![Cursor::collapsed(ms + rlen)]));
+                                st.update_gutter_width();
+                                st.sync_wraps_after_edit();
+                                st.update_title();
+                                st.refresh_search_ui();
+                                if let Some((ns, ne)) = st.search.step(true) {
+                                    st.doc.cursors = vec![Cursor { anchor: ns, head: ne }];
+                                }
+                                st.ensure_caret_visible();
+                            }
+                        }
+                        return 0;
+                    }
+                    IDC_BTN_REPLACE_ALL => {
+                        if !st.search.matches.is_empty() {
+                            let rep = st.search.replace_with.clone();
+                            let edits: Vec<(usize, usize, String)> = st
+                                .search
+                                .matches
+                                .iter()
+                                .map(|&(s, e)| (s, e, rep.clone()))
+                                .collect();
+                            st.doc.apply_edits(edits, None);
+                            st.update_gutter_width();
+                            st.sync_wraps_after_edit();
+                            st.ensure_caret_visible();
+                            st.update_title();
+                            st.refresh_search_ui();
+                        }
+                        return 0;
+                    }
+                    IDC_BTN_CLOSE => {
+                        st.hide_find_panel();
+                        return 0;
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+pub fn create_find_panel(state: &mut AppState, hinst: HINSTANCE) {
+    unsafe {
+        let cls = to_wide("NotepadLiteFindPanel");
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: 0,
+            lpfnWndProc: Some(find_panel_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinst,
+            hIcon: null_mut(),
+            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+            hbrBackground: null_mut(),
+            lpszMenuName: null(),
+            lpszClassName: cls.as_ptr(),
+            hIconSm: null_mut(),
+        };
+        RegisterClassExW(&wc);
+
+        let panel = CreateWindowExW(
+            WS_EX_CONTROLPARENT,
+            cls.as_ptr(),
+            null(),
+            WS_CHILD | WS_BORDER | WS_CLIPSIBLINGS,
+            0,
+            0,
+            FIND_PANEL_W,
+            FIND_PANEL_H,
+            state.hwnd,
+            null_mut(),
+            hinst,
+            null(),
+        );
+        state.find_panel = panel;
+
+        let mk = |cls_name: &str, text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: i32| -> HWND {
+            let wc = to_wide(cls_name);
+            let wt = to_wide(text);
+            let ch = CreateWindowExW(
+                0,
+                wc.as_ptr(),
+                wt.as_ptr(),
+                WS_CHILD | WS_VISIBLE | style,
+                x,
+                y,
+                w,
+                h,
+                panel,
+                id as isize as HMENU,
+                hinst,
+                null(),
+            );
+            SendMessageW(ch, WM_SETFONT as u32, state.hfont_ui as usize, 1);
+            ch
+        };
+
+        state.find_edit = mk("EDIT", "", WS_BORDER | ES_AUTOHSCROLL as u32, 8, 8, 200, 24, IDC_FIND_EDIT);
+        state.lbl_count = mk("STATIC", "0 / 0", SS_CENTER, 214, 12, 74, 20, IDC_LBL_COUNT);
+        mk("BUTTON", "↑", BS_PUSHBUTTON as u32, 294, 8, 30, 24, IDC_BTN_PREV);
+        mk("BUTTON", "↓", BS_PUSHBUTTON as u32, 328, 8, 30, 24, IDC_BTN_NEXT);
+        mk("BUTTON", "×", BS_PUSHBUTTON as u32, 392, 8, 28, 24, IDC_BTN_CLOSE);
+
+        state.chk_case = mk("BUTTON", "区分大小写", BS_AUTOCHECKBOX as u32, 8, 38, 92, 22, IDC_CHK_CASE);
+        state.chk_word = mk("BUTTON", "全词匹配", BS_AUTOCHECKBOX as u32, 106, 38, 80, 22, IDC_CHK_WORD);
+        state.chk_regex = mk("BUTTON", "正则(Regex)", BS_AUTOCHECKBOX as u32, 192, 38, 100, 22, IDC_CHK_REGEX);
+
+        state.replace_edit = mk("EDIT", "", WS_BORDER | ES_AUTOHSCROLL as u32, 8, 70, 200, 24, IDC_REPLACE_EDIT);
+        mk("BUTTON", "替换", BS_PUSHBUTTON as u32, 214, 70, 68, 24, IDC_BTN_REPLACE);
+        mk("BUTTON", "全部替换", BS_PUSHBUTTON as u32, 288, 70, 86, 24, IDC_BTN_REPLACE_ALL);
+
+        state.orig_find_edit_proc = SetWindowLongPtrW(state.find_edit, GWLP_WNDPROC, edit_box_subclass as isize);
+        state.orig_rep_edit_proc = SetWindowLongPtrW(state.replace_edit, GWLP_WNDPROC, edit_box_subclass as isize);
+    }
+}
+
+unsafe extern "system" fn goto_edit_subclass(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
+    let orig = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    if msg == WM_KEYDOWN {
+        let dlg = GetParent(hwnd);
+        if wp == VK_RETURN as usize {
+            SendMessageW(dlg, WM_COMMAND, IDC_GOTO_OK as usize, 0);
+            return 0;
+        }
+        if wp == VK_ESCAPE as usize {
+            SendMessageW(dlg, WM_COMMAND, IDC_GOTO_CANCEL as usize, 0);
+            return 0;
+        }
+    }
+    let prev: WNDPROC = std::mem::transmute(orig);
+    CallWindowProcW(prev, hwnd, msg, wp, lp)
+}
+
+unsafe extern "system" fn goto_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
+    let main_hwnd = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as HWND;
+    let state_ptr = if !main_hwnd.is_null() {
+        GetWindowLongPtrW(main_hwnd, GWLP_USERDATA) as *mut AppState
+    } else {
+        null_mut()
+    };
+
+    match msg {
+        WM_COMMAND if !state_ptr.is_null() => {
+            let st = &mut *state_ptr;
+            let id = lo_word(wp) as i32;
+            if id == IDC_GOTO_OK {
+                let s = get_win_text(st.goto_edit);
+                if let Ok(line_num) = s.trim().parse::<usize>() {
+                    let target = line_num.saturating_sub(1).min(st.doc.line_count().saturating_sub(1));
+                    let pos = st.doc.line_col_to_byte(target, 0);
+                    st.doc.cursors = vec![Cursor::collapsed(pos)];
+                    st.ensure_caret_visible();
+                    st.invalidate();
+                }
+                DestroyWindow(hwnd);
+                st.goto_hwnd = null_mut();
+                SetFocus(st.hwnd);
+                return 0;
+            } else if id == IDC_GOTO_CANCEL {
+                DestroyWindow(hwnd);
+                st.goto_hwnd = null_mut();
+                SetFocus(st.hwnd);
+                return 0;
+            }
+        }
+        WM_CLOSE if !state_ptr.is_null() => {
+            let st = &mut *state_ptr;
+            DestroyWindow(hwnd);
+            st.goto_hwnd = null_mut();
+            SetFocus(st.hwnd);
+            return 0;
+        }
+        _ => {}
+    }
+    DefWindowProcW(hwnd, msg, wp, lp)
+}
+
+pub fn show_goto_dialog(state: &mut AppState) {
+    unsafe {
+        if !state.goto_hwnd.is_null() {
+            SetFocus(state.goto_edit);
+            return;
+        }
+        let hinst = GetModuleHandleW(null());
+        let cls = to_wide("NotepadLiteGotoDlg");
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style: 0,
+            lpfnWndProc: Some(goto_proc),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: hinst,
+            hIcon: null_mut(),
+            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+            hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
+            lpszMenuName: null(),
+            lpszClassName: cls.as_ptr(),
+            hIconSm: null_mut(),
+        };
+        RegisterClassExW(&wc);
+
+        let mut rc: RECT = std::mem::zeroed();
+        GetWindowRect(state.hwnd, &mut rc);
+        let title = to_wide("转到指定行");
+        let dlg = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            cls.as_ptr(),
+            title.as_ptr(),
+            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
+            rc.left + 120,
+            rc.top + 120,
+            260,
+            125,
+            state.hwnd,
+            null_mut(),
+            hinst,
+            null(),
+        );
+        SetWindowLongPtrW(dlg, GWLP_USERDATA, state.hwnd as isize);
+        state.goto_hwnd = dlg;
+
+        let lbl = to_wide(&format!("行号 (1 - {}):", state.doc.line_count()));
+        let st_cls = to_wide("STATIC");
+        let h1 = CreateWindowExW(0, st_cls.as_ptr(), lbl.as_ptr(), WS_CHILD | WS_VISIBLE, 12, 10, 220, 18, dlg, null_mut(), hinst, null());
+        SendMessageW(h1, WM_SETFONT as u32, state.hfont_ui as usize, 1);
+
+        let ed_cls = to_wide("EDIT");
+        let (cur_l, _) = state.doc.byte_to_line_col(state.doc.primary().head);
+        let init_v = to_wide(&(cur_l + 1).to_string());
+        let ed = CreateWindowExW(
+            0,
+            ed_cls.as_ptr(),
+            init_v.as_ptr(),
+            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32,
+            12,
+            30,
+            220,
+            24,
+            dlg,
+            IDC_GOTO_EDIT as isize as HMENU,
+            hinst,
+            null(),
+        );
+        SendMessageW(ed, WM_SETFONT as u32, state.hfont_ui as usize, 1);
+        let orig_ed = SetWindowLongPtrW(ed, GWLP_WNDPROC, goto_edit_subclass as isize);
+        SetWindowLongPtrW(ed, GWLP_USERDATA, orig_ed);
+        state.goto_edit = ed;
+
+        let bt_cls = to_wide("BUTTON");
+        let ok_t = to_wide("确定");
+        let ca_t = to_wide("取消");
+        let b1 = CreateWindowExW(0, bt_cls.as_ptr(), ok_t.as_ptr(), WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON as u32, 82, 62, 70, 24, dlg, IDC_GOTO_OK as isize as HMENU, hinst, null());
+        let b2 = CreateWindowExW(0, bt_cls.as_ptr(), ca_t.as_ptr(), WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 162, 62, 70, 24, dlg, IDC_GOTO_CANCEL as isize as HMENU, hinst, null());
+        SendMessageW(b1, WM_SETFONT as u32, state.hfont_ui as usize, 1);
+        SendMessageW(b2, WM_SETFONT as u32, state.hfont_ui as usize, 1);
+        SetFocus(ed);
+        SendMessageW(ed, EM_SETSEL as u32, 0, -1);
+    }
+}
+
+// ============================================================================
+// 3. 主菜单构建与程序入口
+// ============================================================================
+
+pub fn build_main_menu() -> (HMENU, HMENU) {
     unsafe {
         let root = CreateMenu();
         let add = |menu: HMENU, id: usize, label: &str| {
@@ -83,6 +650,11 @@ pub fn build_main_menu() -> HMENU {
         add(m_file, IDM_FILE_SAVE, "保存(&S)\tCtrl+S");
         add(m_file, IDM_FILE_SAVEAS, "另存为(&A)...\tCtrl+Shift+S");
         add(m_file, IDM_FILE_RELOAD, "从磁盘重新加载(&R)\tF5");
+        AppendMenuW(m_file, MF_SEPARATOR, 0, null());
+        let m_recent = CreatePopupMenu();
+        let empty_w = to_wide("（无历史记录）");
+        AppendMenuW(m_recent, MF_STRING | MF_GRAYED, 0, empty_w.as_ptr());
+        add_pop(m_file, m_recent, "最近打开的文件(&H)");
         AppendMenuW(m_file, MF_SEPARATOR, 0, null());
         add(m_file, IDM_FILE_EXIT, "退出(&X)\tAlt+F4");
         add_pop(root, m_file, "文件(&F)");
@@ -139,7 +711,7 @@ pub fn build_main_menu() -> HMENU {
         add(m_eol, IDM_EOL_LF, "Unix / Linux (LF)");
         add_pop(root, m_eol, "换行符(&L)");
 
-        root
+        (root, m_recent)
     }
 }
 
@@ -173,7 +745,7 @@ fn main() {
             return;
         }
 
-        let hmenu = build_main_menu();
+        let (hmenu, recent_menu) = build_main_menu();
         let ex_style = if cfg.always_on_top { WS_EX_TOPMOST } else { 0 };
         let title = to_wide("无标题 - NotepadLite");
         let hwnd = CreateWindowExW(
@@ -234,6 +806,7 @@ fn main() {
         let dark = cfg.dark_theme;
         let mut state = Box::new(AppState {
             hwnd,
+            recent_menu,
             hfont_regular: null_mut(),
             hfont_bold: null_mut(),
             hfont_italic: null_mut(),
@@ -253,8 +826,9 @@ fn main() {
             gutter_w: 14,
             scroll_y: 0,
             scroll_x: 0,
-            last_wrap_px: 0,
-            line_wraps: Vec::new(),
+            wrap_max_px_cached: 0,
+            line_wraps: vec![None],
+            line_row_counts: vec![1],
             visual_prefix: vec![0, 1],
             dragging: false,
             rect_selecting: false,
