@@ -26,7 +26,7 @@ pub fn from_wide_slice(slice: &[u16]) -> String {
 }
 
 // ============================================================================
-// 1. 启动期错误日志与崩溃捕获（程序入口第一行即启用）
+// 1. 启动期错误日志与崩溃捕获
 // ============================================================================
 
 static LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
@@ -86,7 +86,7 @@ pub fn show_fatal_box(title: &str, msg: &str) {
 }
 
 // ============================================================================
-// 2. 绿色便携配置（严格保存在 exe 同级目录 config.json）
+// 2. 绿色便携配置（exe 同级目录 config.json）
 // ============================================================================
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -105,6 +105,8 @@ pub struct AppConfig {
     pub show_line_numbers: bool,
     pub show_whitespace: bool,
     pub always_on_top: bool,
+    pub outline_visible: bool,
+    pub outline_width: i32,
     pub recent_files: Vec<String>,
 }
 
@@ -113,17 +115,19 @@ impl Default for AppConfig {
         Self {
             win_x: CW_USEDEFAULT,
             win_y: CW_USEDEFAULT,
-            win_w: 1080,
-            win_h: 720,
+            win_w: 1120,
+            win_h: 740,
             maximized: false,
             font_name: "Consolas".to_string(),
-            font_size: 15,
+            font_size: 16,
             zoom_pct: 100,
             dark_theme: true,
-            word_wrap: false,
-            show_line_numbers: true,
+            word_wrap: true,
+            show_line_numbers: false,
             show_whitespace: false,
             always_on_top: false,
+            outline_visible: false,
+            outline_width: 245,
             recent_files: Vec::new(),
         }
     }
@@ -165,7 +169,7 @@ pub fn save_config(cfg: &AppConfig) {
 }
 
 // ============================================================================
-// 3. 字符编码识别与转换（UTF-8 / UTF-8 BOM / UTF-16 LE&BE / GBK / Big5）
+// 3. 字符编码自动识别与读写（无手动转码，打开时自动识别）
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -236,54 +240,42 @@ pub fn normalize_newlines_fast(input: &str) -> (String, LineEnding) {
     (s, eol)
 }
 
-pub fn load_file_with_encoding(
-    path: &Path,
-    forced: Option<DocEncoding>,
-) -> Result<(String, DocEncoding, LineEnding, usize), String> {
+pub fn load_file_auto_encoding(path: &Path) -> Result<(String, DocEncoding, LineEnding, usize), String> {
     let bytes = fs::read(path).map_err(|e| format!("读取文件失败: {}", e))?;
     let byte_size = bytes.len();
 
-    let (doc_enc, bom_len, rs_enc): (DocEncoding, usize, &'static Encoding) = if let Some(fe) = forced {
-        let (bl, re) = match fe {
-            DocEncoding::Utf8 => (0, UTF_8),
-            DocEncoding::Utf8Bom => (if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 }, UTF_8),
-            DocEncoding::Utf16Le => (if bytes.starts_with(&[0xFF, 0xFE]) { 2 } else { 0 }, UTF_16LE),
-            DocEncoding::Utf16Be => (if bytes.starts_with(&[0xFE, 0xFF]) { 2 } else { 0 }, UTF_16BE),
-            DocEncoding::Gbk => (0, GB18030),
-            DocEncoding::Big5 => (0, BIG5),
-        };
-        (fe, bl, re)
-    } else if let Some((enc, bl)) = Encoding::for_bom(&bytes) {
-        let de = if enc == UTF_8 {
-            DocEncoding::Utf8Bom
-        } else if enc == UTF_16LE {
-            DocEncoding::Utf16Le
-        } else if enc == UTF_16BE {
-            DocEncoding::Utf16Be
+    let (doc_enc, bom_len, rs_enc): (DocEncoding, usize, &'static Encoding) =
+        if let Some((enc, bl)) = Encoding::for_bom(&bytes) {
+            let de = if enc == UTF_8 {
+                DocEncoding::Utf8Bom
+            } else if enc == UTF_16LE {
+                DocEncoding::Utf16Le
+            } else if enc == UTF_16BE {
+                DocEncoding::Utf16Be
+            } else {
+                DocEncoding::Utf8
+            };
+            (de, bl, enc)
+        } else if std::str::from_utf8(&bytes).is_ok() {
+            (DocEncoding::Utf8, 0, UTF_8)
         } else {
-            DocEncoding::Utf8
+            let mut detector = chardetng::EncodingDetector::new();
+            let sample = bytes.len().min(256 * 1024);
+            detector.feed(&bytes[..sample], bytes.len() <= sample);
+            let guessed = detector.guess(None, true);
+            let de = if guessed == BIG5 {
+                DocEncoding::Big5
+            } else if guessed == UTF_16LE {
+                DocEncoding::Utf16Le
+            } else if guessed == UTF_16BE {
+                DocEncoding::Utf16Be
+            } else if guessed == UTF_8 {
+                DocEncoding::Utf8
+            } else {
+                DocEncoding::Gbk
+            };
+            (de, 0, guessed)
         };
-        (de, bl, enc)
-    } else if std::str::from_utf8(&bytes).is_ok() {
-        (DocEncoding::Utf8, 0, UTF_8)
-    } else {
-        let mut detector = chardetng::EncodingDetector::new();
-        let sample = bytes.len().min(256 * 1024);
-        detector.feed(&bytes[..sample], bytes.len() <= sample);
-        let guessed = detector.guess(None, true);
-        let de = if guessed == BIG5 {
-            DocEncoding::Big5
-        } else if guessed == UTF_16LE {
-            DocEncoding::Utf16Le
-        } else if guessed == UTF_16BE {
-            DocEncoding::Utf16Be
-        } else if guessed == UTF_8 {
-            DocEncoding::Utf8
-        } else {
-            DocEncoding::Gbk
-        };
-        (de, 0, guessed)
-    };
 
     let (decoded, _, _) = rs_enc.decode(&bytes[bom_len..]);
     let (normalized, eol) = normalize_newlines_fast(&decoded);
@@ -351,7 +343,7 @@ pub fn save_file_with_encoding(
 }
 
 // ============================================================================
-// 4. 大文件高性能文本缓冲、增量行索引、多光标与撤销重做引擎
+// 4. 高性能文本缓冲、增量行索引、多行语法状态与撤销重做引擎
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -402,6 +394,8 @@ fn clamp_str_boundary(s: &str, pos: usize) -> usize {
 pub struct Document {
     pub text: String,
     pub line_starts: Vec<usize>,
+    pub line_states: Vec<LineState>,
+    pub wrap_patches: Vec<(usize, usize, usize)>, // (start_line, old_count, new_count)
     pub cursors: Vec<Cursor>,
     undo_stack: VecDeque<UndoEntry>,
     redo_stack: VecDeque<UndoEntry>,
@@ -412,6 +406,7 @@ pub struct Document {
     pub disk_bytes: usize,
     pub large_mode: bool,
     pub total_chars: usize,
+    pub lang: Lang,
 }
 
 impl Document {
@@ -419,6 +414,8 @@ impl Document {
         Self {
             text: String::new(),
             line_starts: vec![0],
+            line_states: vec![LineState::Normal],
+            wrap_patches: Vec::new(),
             cursors: vec![Cursor::collapsed(0)],
             undo_stack: VecDeque::new(),
             redo_stack: VecDeque::new(),
@@ -429,6 +426,7 @@ impl Document {
             disk_bytes: 0,
             large_mode: false,
             total_chars: 0,
+            lang: Lang::Markdown,
         }
     }
 
@@ -445,6 +443,39 @@ impl Document {
         } else {
             self.text.chars().count()
         };
+        self.rebuild_all_line_states();
+    }
+
+    pub fn rebuild_all_line_states(&mut self) {
+        let count = self.line_starts.len();
+        self.line_states.clear();
+        self.line_states.resize(count, LineState::Normal);
+        if self.large_mode || self.lang != Lang::Markdown {
+            return;
+        }
+        let mut st = LineState::Normal;
+        for l in 0..count {
+            self.line_states[l] = st;
+            st = advance_md_line_state(st, self.line_str(l));
+        }
+    }
+
+    fn update_line_states_incremental(&mut self, start_line: usize, dirty_end_line: usize) {
+        if self.large_mode || self.lang != Lang::Markdown {
+            return;
+        }
+        let count = self.line_starts.len();
+        if count == 0 || start_line >= count {
+            return;
+        }
+        let mut st = self.line_states[start_line];
+        for l in start_line..count {
+            self.line_states[l] = st;
+            st = advance_md_line_state(st, self.line_str(l));
+            if l + 1 < count && l >= dirty_end_line && self.line_states[l + 1] == st {
+                break;
+            }
+        }
     }
 
     pub fn set_content(
@@ -456,8 +487,10 @@ impl Document {
         disk_bytes: usize,
     ) {
         self.large_mode = text.len() > LARGE_FILE_BYTES;
+        self.lang = detect_lang(path.as_deref());
         self.text = text;
         self.rebuild_line_index();
+        self.wrap_patches.clear();
         self.cursors = vec![Cursor::collapsed(0)];
         self.undo_stack.clear();
         self.redo_stack.clear();
@@ -601,11 +634,19 @@ impl Document {
                 new_lines.push(start + i + 1);
             }
         }
+        let added_count = new_lines.len();
         for s in &mut self.line_starts[end_line + 1..] {
             *s = (*s as isize + delta) as usize;
         }
         self.line_starts.splice((start_line + 1)..=end_line, new_lines);
+
+        let old_span = end_line - start_line + 1;
+        let new_span = added_count + 1;
+        let fill_states = vec![LineState::Normal; added_count];
+        self.line_states.splice((start_line + 1)..=end_line, fill_states);
         self.large_mode = self.text.len() > LARGE_FILE_BYTES;
+        self.update_line_states_incremental(start_line, start_line + added_count);
+        self.wrap_patches.push((start_line, old_span, new_span));
     }
 
     pub fn apply_edits(&mut self, mut edits: Vec<(usize, usize, String)>, new_cursors: Option<Vec<Cursor>>) {
@@ -828,7 +869,8 @@ impl Document {
     pub fn toggle_comment(&mut self, lang: Lang) {
         let prefix = match lang {
             Lang::Python | Lang::Shell | Lang::Ini => "# ",
-            Lang::Plain | Lang::Markdown | Lang::Json | Lang::XmlHtml | Lang::Cpp | Lang::JsTs => "// ",
+            Lang::Markdown => "> ",
+            Lang::Plain | Lang::Json | Lang::XmlHtml | Lang::Cpp | Lang::JsTs => "// ",
         };
         let prefix_trim = prefix.trim_end();
         let c = self.primary();
@@ -974,7 +1016,7 @@ impl SearchState {
 }
 
 // ============================================================================
-// 6. 轻量级可见行即时语法高亮器（O(屏幕可见行数)，大文件零卡顿）
+// 6. Markdown / GFM 与多语言可见行语法高亮引擎（含跨行代码块状态）
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -991,30 +1033,141 @@ pub enum Lang {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+pub enum LineState {
+    Normal,
+    FencedCode {
+        fence_ch: u8,
+        fence_len: u8,
+        inner_lang: Lang,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
     Keyword,
+    Heading1,
+    Heading2,
     StringLit,
     Comment,
     Number,
     Accent,
+    Bold,
+    Italic,
+    Strike,
+    InlineCode,
+    AlertTag,
+    TaskDone,
+    TaskTodo,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct LineAttr {
+    pub is_code_block: bool,
+    pub is_quote: bool,
+    pub is_hr: bool,
+    pub is_table: bool,
 }
 
 pub fn detect_lang(path: Option<&Path>) -> Lang {
-    let ext = path
-        .and_then(|p| p.extension())
+    let Some(p) = path else {
+        return Lang::Markdown;
+    };
+    let ext = p
+        .extension()
         .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
     match ext.as_str() {
-        "md" | "markdown" => Lang::Markdown,
         "json" | "jsonc" => Lang::Json,
         "xml" | "html" | "htm" | "svg" => Lang::XmlHtml,
         "py" | "pyw" => Lang::Python,
-        "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "rs" => Lang::Cpp,
+        "c" | "cc" | "cpp" | "cxx" | "h" | "hpp" | "rs" | "go" | "java" => Lang::Cpp,
         "js" | "jsx" | "ts" | "tsx" | "mjs" => Lang::JsTs,
         "sh" | "bash" | "bat" | "cmd" | "ps1" => Lang::Shell,
-        "ini" | "toml" | "cfg" | "conf" => Lang::Ini,
+        "ini" | "toml" | "cfg" | "conf" | "yaml" | "yml" => Lang::Ini,
+        // 默认未命名、纯文本、Markdown 统一按 Markdown + GFM 解析
+        _ => Lang::Markdown,
+    }
+}
+
+fn lang_from_fence_tag(tag: &str) -> Lang {
+    let t = tag.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+    match t.as_str() {
+        "rs" | "rust" | "c" | "cpp" | "c++" | "h" | "hpp" | "go" | "java" | "cs" => Lang::Cpp,
+        "py" | "python" => Lang::Python,
+        "js" | "javascript" | "ts" | "typescript" | "jsx" | "tsx" => Lang::JsTs,
+        "json" | "jsonc" => Lang::Json,
+        "html" | "xml" | "svg" => Lang::XmlHtml,
+        "sh" | "bash" | "zsh" | "shell" | "bat" | "cmd" | "ps1" | "powershell" => Lang::Shell,
+        "ini" | "toml" | "yaml" | "yml" => Lang::Ini,
         _ => Lang::Plain,
+    }
+}
+
+fn parse_fence_open(line: &str) -> Option<(u8, u8, &str)> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && i < 3 && bytes[i] == b' ' {
+        i += 1;
+    }
+    if i >= bytes.len() {
+        return None;
+    }
+    let ch = bytes[i];
+    if ch != b'`' && ch != b'~' {
+        return None;
+    }
+    let start = i;
+    while i < bytes.len() && bytes[i] == ch {
+        i += 1;
+    }
+    let count = i - start;
+    if count < 3 {
+        return None;
+    }
+    let info = line[i..].trim();
+    if ch == b'`' && info.contains('`') {
+        return None;
+    }
+    Some((ch, count.min(255) as u8, info))
+}
+
+fn is_fence_close(line: &str, fence_ch: u8, fence_len: u8) -> bool {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && i < 3 && bytes[i] == b' ' {
+        i += 1;
+    }
+    let start = i;
+    while i < bytes.len() && bytes[i] == fence_ch {
+        i += 1;
+    }
+    if i - start < fence_len as usize {
+        return false;
+    }
+    line[i..].trim().is_empty()
+}
+
+pub fn advance_md_line_state(state: LineState, line: &str) -> LineState {
+    match state {
+        LineState::Normal => {
+            if let Some((ch, len, info)) = parse_fence_open(line) {
+                LineState::FencedCode {
+                    fence_ch: ch,
+                    fence_len: len,
+                    inner_lang: lang_from_fence_tag(info),
+                }
+            } else {
+                LineState::Normal
+            }
+        }
+        LineState::FencedCode { fence_ch, fence_len, .. } => {
+            if is_fence_close(line, fence_ch, fence_len) {
+                LineState::Normal
+            } else {
+                state
+            }
+        }
     }
 }
 
@@ -1037,7 +1190,7 @@ fn is_keyword(lang: Lang, word: &str) -> bool {
                 | "continue" | "return" | "struct" | "class" | "enum" | "const" | "static"
                 | "void" | "int" | "char" | "bool" | "float" | "double" | "auto" | "fn"
                 | "let" | "mut" | "pub" | "use" | "mod" | "impl" | "match" | "true"
-                | "false" | "nullptr" | "NULL" | "include" | "define"
+                | "false" | "nullptr" | "NULL" | "include" | "define" | "func" | "package"
         ),
         Lang::JsTs => matches!(
             word,
@@ -1056,35 +1209,22 @@ fn is_keyword(lang: Lang, word: &str) -> bool {
     }
 }
 
-pub fn highlight_line(lang: Lang, line: &str) -> Vec<(usize, usize, TokenKind)> {
-    let mut out = Vec::new();
+fn highlight_code_line(lang: Lang, line: &str, out: &mut Vec<(usize, usize, TokenKind)>) {
     if lang == Lang::Plain || line.is_empty() {
-        return out;
+        return;
     }
     let bytes = line.as_bytes();
     let len = bytes.len();
-
-    if lang == Lang::Markdown {
-        let trimmed = line.trim_start();
-        if trimmed.starts_with('#') {
-            out.push((0, len, TokenKind::Keyword));
-            return out;
-        }
-        if trimmed.starts_with('>') {
-            out.push((0, len, TokenKind::Comment));
-            return out;
-        }
-    }
 
     if lang == Lang::Ini {
         let ws = len - line.trim_start().len();
         if bytes.get(ws) == Some(&b';') || bytes.get(ws) == Some(&b'#') {
             out.push((ws, len, TokenKind::Comment));
-            return out;
+            return;
         }
         if bytes.get(ws) == Some(&b'[') {
             out.push((ws, len, TokenKind::Keyword));
-            return out;
+            return;
         }
     }
 
@@ -1103,7 +1243,7 @@ pub fn highlight_line(lang: Lang, line: &str) -> Vec<(usize, usize, TokenKind)> 
             out.push((i, len, TokenKind::Comment));
             break;
         }
-        if b == b'"' || (b == b'\'' && lang != Lang::Markdown) {
+        if b == b'"' || b == b'\'' {
             let quote = b;
             let start = i;
             i += 1;
@@ -1153,5 +1293,504 @@ pub fn highlight_line(lang: Lang, line: &str) -> Vec<(usize, usize, TokenKind)> 
         }
         i += 1;
     }
-    out
+}
+
+fn is_horizontal_rule(line: &str) -> bool {
+    let t = line.trim();
+    if t.len() < 3 {
+        return false;
+    }
+    let ch = t.as_bytes()[0];
+    if ch != b'-' && ch != b'*' && ch != b'_' {
+        return false;
+    }
+    let count = t.bytes().filter(|&b| b == ch).count();
+    let valid = t.bytes().all(|b| b == ch || b == b' ' || b == b'\t');
+    valid && count >= 3
+}
+
+fn is_gfm_table_delimiter(line: &str) -> bool {
+    let t = line.trim();
+    if !t.contains('-') || !t.contains('|') {
+        return false;
+    }
+    t.bytes().all(|b| matches!(b, b'|' | b'-' | b':' | b' ' | b'\t'))
+}
+
+fn scan_inline_md(
+    line: &str,
+    from: usize,
+    to: usize,
+    base_kind: Option<TokenKind>,
+    out: &mut Vec<(usize, usize, TokenKind)>,
+) {
+    let bytes = line.as_bytes();
+    let mut i = from;
+    let mut plain_start = from;
+
+    let flush_plain = |ps: usize, pe: usize, out_vec: &mut Vec<(usize, usize, TokenKind)>| {
+        if ps < pe {
+            if let Some(bk) = base_kind {
+                out_vec.push((ps, pe, bk));
+            }
+        }
+    };
+
+    while i < to {
+        let b = bytes[i];
+
+        // 转义字符
+        if b == b'\\' && i + 1 < to {
+            i += 2;
+            continue;
+        }
+
+        // 行内代码 `...`
+        if b == b'`' {
+            let mut ticks = 0usize;
+            while i + ticks < to && bytes[i + ticks] == b'`' {
+                ticks += 1;
+            }
+            let mut j = i + ticks;
+            let mut found = None;
+            while j < to {
+                if bytes[j] == b'`' {
+                    let mut c = 0usize;
+                    while j + c < to && bytes[j + c] == b'`' {
+                        c += 1;
+                    }
+                    if c == ticks {
+                        found = Some(j + c);
+                        break;
+                    }
+                    j += c;
+                } else {
+                    j += 1;
+                }
+            }
+            if let Some(end) = found {
+                flush_plain(plain_start, i, out);
+                out.push((i, end, TokenKind::InlineCode));
+                i = end;
+                plain_start = i;
+                continue;
+            }
+            i += ticks;
+            continue;
+        }
+
+        // GFM 表格竖线
+        if base_kind.is_none() && b == b'|' {
+            flush_plain(plain_start, i, out);
+            out.push((i, i + 1, TokenKind::Accent));
+            i += 1;
+            plain_start = i;
+            continue;
+        }
+
+        // 图片与链接 ![alt](url) / [text](url)
+        if b == b'!' && i + 1 < to && bytes[i + 1] == b'[' || b == b'[' {
+            let lb = if b == b'!' { i + 1 } else { i };
+            if let Some(rb_rel) = line[lb + 1..to].find(']') {
+                let rb = lb + 1 + rb_rel;
+                if rb + 1 < to && bytes[rb + 1] == b'(' {
+                    if let Some(rp_rel) = line[rb + 2..to].find(')') {
+                        let rp = rb + 2 + rp_rel + 1;
+                        flush_plain(plain_start, i, out);
+                        out.push((i, rb + 1, TokenKind::Accent));
+                        out.push((rb + 1, rp, TokenKind::StringLit));
+                        i = rp;
+                        plain_start = i;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 自动链接 <https://...>
+        if b == b'<' {
+            if let Some(gt_rel) = line[i + 1..to].find('>') {
+                let inner = &line[i + 1..i + 1 + gt_rel];
+                if inner.starts_with("http://") || inner.starts_with("https://") || inner.contains('@') {
+                    let end = i + 1 + gt_rel + 1;
+                    flush_plain(plain_start, i, out);
+                    out.push((i, end, TokenKind::StringLit));
+                    i = end;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+
+        // GFM 删除线 ~~...~~
+        if b == b'~' && i + 1 < to && bytes[i + 1] == b'~' {
+            if let Some(end_rel) = line[i + 2..to].find("~~") {
+                if end_rel > 0 {
+                    let end = i + 2 + end_rel + 2;
+                    flush_plain(plain_start, i, out);
+                    out.push((i, end, TokenKind::Strike));
+                    i = end;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+
+        // 粗体 **...** 或 __...__
+        if (b == b'*' || b == b'_') && i + 1 < to && bytes[i + 1] == b {
+            let pat = if b == b'*' { "**" } else { "__" };
+            let word_ok = b == b'*' || i == from || !is_ident_char(bytes[i - 1]);
+            if word_ok {
+                if let Some(end_rel) = line[i + 2..to].find(pat) {
+                    if end_rel > 0 {
+                        let end = i + 2 + end_rel + 2;
+                        flush_plain(plain_start, i, out);
+                        out.push((i, end, TokenKind::Bold));
+                        i = end;
+                        plain_start = i;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // 斜体 *...* 或 _..._
+        if b == b'*' || b == b'_' {
+            let word_ok = b == b'*' || i == from || !is_ident_char(bytes[i - 1]);
+            if word_ok && i + 1 < to && bytes[i + 1] != b' ' && bytes[i + 1] != b {
+                let mut j = i + 1;
+                let mut found = None;
+                while j < to {
+                    if bytes[j] == b'\\' && j + 1 < to {
+                        j += 2;
+                        continue;
+                    }
+                    if bytes[j] == b && bytes[j - 1] != b' ' {
+                        if b == b'*' || j + 1 >= to || !is_ident_char(bytes[j + 1]) {
+                            found = Some(j + 1);
+                            break;
+                        }
+                    }
+                    j += 1;
+                }
+                if let Some(end) = found {
+                    flush_plain(plain_start, i, out);
+                    out.push((i, end, TokenKind::Italic));
+                    i = end;
+                    plain_start = i;
+                    continue;
+                }
+            }
+        }
+
+        // 跳过 UTF-8 多字节字符的后续字节
+        i += 1;
+        while i < to && !line.is_char_boundary(i) {
+            i += 1;
+        }
+    }
+    flush_plain(plain_start, to, out);
+}
+
+pub fn highlight_line_with_state(
+    lang: Lang,
+    line: &str,
+    state: LineState,
+) -> (Vec<(usize, usize, TokenKind)>, LineAttr) {
+    let mut out = Vec::new();
+    let mut attr = LineAttr::default();
+    if line.is_empty() || lang == Lang::Plain {
+        return (out, attr);
+    }
+    if lang != Lang::Markdown {
+        highlight_code_line(lang, line, &mut out);
+        return (out, attr);
+    }
+
+    let len = line.len();
+    let bytes = line.as_bytes();
+
+    // 1. 处于跨行围栏代码块内
+    if let LineState::FencedCode { fence_ch, fence_len, inner_lang } = state {
+        attr.is_code_block = true;
+        if is_fence_close(line, fence_ch, fence_len) {
+            out.push((0, len, TokenKind::Accent));
+        } else {
+            highlight_code_line(inner_lang, line, &mut out);
+        }
+        return (out, attr);
+    }
+
+    // 2. 开启围栏代码块 ```lang / ~~~
+    if parse_fence_open(line).is_some() {
+        attr.is_code_block = true;
+        let ws = len - line.trim_start().len();
+        let mut fence_end = ws;
+        while fence_end < len && (bytes[fence_end] == b'`' || bytes[fence_end] == b'~') {
+            fence_end += 1;
+        }
+        out.push((ws, fence_end, TokenKind::Accent));
+        if fence_end < len {
+            out.push((fence_end, len, TokenKind::Keyword));
+        }
+        return (out, attr);
+    }
+
+    let ws = len - line.trim_start().len();
+    let rest = &line[ws..];
+
+    // 3. 缩进代码块（4空格或Tab开头且非空）
+    if (ws >= 4 || bytes.first() == Some(&b'\t')) && !rest.is_empty() {
+        attr.is_code_block = true;
+        out.push((0, len, TokenKind::InlineCode));
+        return (out, attr);
+    }
+
+    // 4. 分割线 --- / *** / ___
+    if ws <= 3 && is_horizontal_rule(rest) {
+        attr.is_hr = true;
+        out.push((ws, len, TokenKind::Comment));
+        return (out, attr);
+    }
+
+    // 5. ATX 标题 (# ~ ######)
+    if ws <= 3 && rest.starts_with('#') {
+        let mut hashes = 0usize;
+        while hashes < rest.len() && rest.as_bytes()[hashes] == b'#' {
+            hashes += 1;
+        }
+        if hashes >= 1 && hashes <= 6 && (hashes == rest.len() || rest.as_bytes()[hashes] == b' ' || rest.as_bytes()[hashes] == b'\t') {
+            let h_kind = if hashes <= 2 { TokenKind::Heading1 } else { TokenKind::Heading2 };
+            out.push((ws, ws + hashes, TokenKind::Accent));
+            if ws + hashes < len {
+                out.push((ws + hashes, len, h_kind));
+            }
+            return (out, attr);
+        }
+    }
+
+    // 6. 引用块 & GFM Alerts (> [!NOTE] 等)
+    if ws <= 3 && rest.starts_with('>') {
+        attr.is_quote = true;
+        let mut q_end = ws;
+        while q_end < len && (bytes[q_end] == b'>' || bytes[q_end] == b' ') {
+            q_end += 1;
+        }
+        out.push((ws, q_end, TokenKind::Accent));
+        let q_rest = &line[q_end..];
+        let upper_prefix: String = q_rest.chars().take(14).collect::<String>().to_ascii_uppercase();
+        let alert_match = ["[!NOTE]", "[!TIP]", "[!IMPORTANT]", "[!WARNING]", "[!CAUTION]"]
+            .iter()
+            .find(|&&tag| upper_prefix.starts_with(tag))
+            .copied();
+        if let Some(tag) = alert_match {
+            let tag_end = q_end + tag.len();
+            out.push((q_end, tag_end, TokenKind::AlertTag));
+            scan_inline_md(line, tag_end, len, Some(TokenKind::Comment), &mut out);
+        } else {
+            scan_inline_md(line, q_end, len, Some(TokenKind::Comment), &mut out);
+        }
+        return (out, attr);
+    }
+
+    // 7. GFM 表格分隔行 / 数据行
+    if is_gfm_table_delimiter(line) {
+        attr.is_table = true;
+        out.push((ws, len, TokenKind::Accent));
+        return (out, attr);
+    }
+    if rest.starts_with('|') {
+        attr.is_table = true;
+    }
+
+    // 8. 任务列表 & 无序/有序列表
+    let mut content_start = ws;
+    if ws <= 3 {
+        let rb = rest.as_bytes();
+        if !rb.is_empty() && matches!(rb[0], b'-' | b'*' | b'+') && rb.get(1).copied().is_some_and(|c| c == b' ' || c == b'\t') {
+            out.push((ws, ws + 1, TokenKind::Number));
+            content_start = ws + 2;
+            let after = &line[content_start..];
+            if after.starts_with("[ ]") && (after.len() == 3 || after.as_bytes()[3] == b' ') {
+                out.push((content_start, content_start + 3, TokenKind::TaskTodo));
+                content_start += 3;
+            } else if (after.starts_with("[x]") || after.starts_with("[X]"))
+                && (after.len() == 3 || after.as_bytes()[3] == b' ')
+            {
+                out.push((content_start, content_start + 3, TokenKind::TaskDone));
+                content_start += 3;
+            }
+        } else {
+            let mut d = 0usize;
+            while d < rb.len() && rb[d].is_ascii_digit() && d < 9 {
+                d += 1;
+            }
+            if d > 0 && d + 1 < rb.len() && (rb[d] == b'.' || rb[d] == b')') && (rb[d + 1] == b' ' || rb[d + 1] == b'\t') {
+                out.push((ws, ws + d + 1, TokenKind::Number));
+                content_start = ws + d + 2;
+            }
+        }
+    }
+
+    // 9. 行内 Markdown 元素扫描
+    scan_inline_md(line, content_start, len, None, &mut out);
+    (out, attr)
+}
+
+// ============================================================================
+// 7. Markdown 大纲解析器（非实时按需刷新 + 主次级别折叠）
+// ============================================================================
+
+#[derive(Clone)]
+pub struct OutlineNode {
+    pub level: u8,
+    pub title: String,
+    pub line: usize,
+    pub byte_pos: usize,
+    pub has_children: bool,
+    pub collapsed: bool,
+}
+
+pub struct OutlineState {
+    pub nodes: Vec<OutlineNode>,
+    pub selected_idx: Option<usize>,
+    pub scroll_row: usize,
+}
+
+impl OutlineState {
+    pub fn new() -> Self {
+        Self {
+            nodes: Vec::new(),
+            selected_idx: None,
+            scroll_row: 0,
+        }
+    }
+
+    pub fn refresh_from_doc(&mut self, doc: &Document) {
+        // 记录之前的折叠状态（按 line + title 尽量保留）
+        let prev_collapsed: Vec<(u8, String)> = self
+            .nodes
+            .iter()
+            .filter(|n| n.collapsed)
+            .map(|n| (n.level, n.title.clone()))
+            .collect();
+
+        let mut parsed = Vec::new();
+        let line_cnt = doc.line_count();
+        let mut in_fence: Option<(u8, u8)> = None;
+
+        for l in 0..line_cnt {
+            let line = doc.line_str(l);
+            if let Some((fc, fl)) = in_fence {
+                if is_fence_close(line, fc, fl) {
+                    in_fence = None;
+                }
+                continue;
+            }
+            if let Some((fc, fl, _)) = parse_fence_open(line) {
+                in_fence = Some((fc, fl));
+                continue;
+            }
+
+            let trimmed = line.trim_start();
+            let ws = line.len() - trimmed.len();
+            if ws <= 3 && trimmed.starts_with('#') {
+                let mut hashes = 0usize;
+                while hashes < trimmed.len() && trimmed.as_bytes()[hashes] == b'#' {
+                    hashes += 1;
+                }
+                if (1..=6).contains(&hashes)
+                    && (hashes == trimmed.len() || trimmed.as_bytes()[hashes] == b' ' || trimmed.as_bytes()[hashes] == b'\t')
+                {
+                    let raw = trimmed[hashes..].trim();
+                    let title = raw.trim_end_matches('#').trim_end().to_string();
+                    if !title.is_empty() {
+                        parsed.push(OutlineNode {
+                            level: hashes as u8,
+                            title,
+                            line: l,
+                            byte_pos: doc.line_starts[l],
+                            has_children: false,
+                            collapsed: false,
+                        });
+                    }
+                    continue;
+                }
+            }
+
+            // 支持 Setext 标题 (=== / ---)
+            if l > 0 && ws <= 3 {
+                let t = trimmed.trim_end();
+                if t.len() >= 3 && (t.bytes().all(|b| b == b'=') || t.bytes().all(|b| b == b'-')) {
+                    let prev_line = doc.line_str(l - 1).trim();
+                    if !prev_line.is_empty()
+                        && !prev_line.starts_with('#')
+                        && !prev_line.starts_with('>')
+                        && !prev_line.starts_with("```")
+                        && !prev_line.starts_with('|')
+                        && parsed.last().map(|n: &OutlineNode| n.line != l - 1).unwrap_or(true)
+                    {
+                        let lvl = if t.as_bytes()[0] == b'=' { 1 } else { 2 };
+                        parsed.push(OutlineNode {
+                            level: lvl,
+                            title: prev_line.to_string(),
+                            line: l - 1,
+                            byte_pos: doc.line_starts[l - 1],
+                            has_children: false,
+                            collapsed: false,
+                        });
+                    }
+                }
+            }
+        }
+
+        for i in 0..parsed.len() {
+            if i + 1 < parsed.len() && parsed[i + 1].level > parsed[i].level {
+                parsed[i].has_children = true;
+            }
+            if prev_collapsed.iter().any(|(lv, t)| *lv == parsed[i].level && t == &parsed[i].title) && parsed[i].has_children {
+                parsed[i].collapsed = true;
+            }
+        }
+
+        self.nodes = parsed;
+        self.selected_idx = None;
+        self.scroll_row = 0;
+    }
+
+    pub fn visible_indices(&self) -> Vec<usize> {
+        let mut vis = Vec::with_capacity(self.nodes.len());
+        let mut hide_above_level: Option<u8> = None;
+        for (i, node) in self.nodes.iter().enumerate() {
+            if let Some(lvl) = hide_above_level {
+                if node.level > lvl {
+                    continue;
+                } else {
+                    hide_above_level = None;
+                }
+            }
+            vis.push(i);
+            if node.collapsed && node.has_children {
+                hide_above_level = Some(node.level);
+            }
+        }
+        vis
+    }
+
+    pub fn toggle_collapse(&mut self, idx: usize) {
+        if let Some(n) = self.nodes.get_mut(idx) {
+            if n.has_children {
+                n.collapsed = !n.collapsed;
+            }
+        }
+    }
+
+    pub fn set_all_collapsed(&mut self, collapsed: bool) {
+        for n in &mut self.nodes {
+            if n.has_children {
+                n.collapsed = collapsed;
+            }
+        }
+        self.scroll_row = 0;
+    }
 }
