@@ -14,26 +14,27 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::engine::*;
+use crate::render::{
+    apply_titlebar_theme, compute_line_wraps_with_dc, expand_tabs_col, expand_tabs_with_u16_map,
+    get_theme, paint_editor, VisualSeg, OUTLINE_HEADER_H, OUTLINE_ROW_H, STATUS_BAR_HEIGHT,
+};
 use crate::{
-    IDM_EDIT_COMMENT, IDM_EDIT_COPY, IDM_EDIT_CUT, IDM_EDIT_DEL_LINE, IDM_EDIT_DUP_LINE,
-    IDM_EDIT_LOWER, IDM_EDIT_MOVE_DOWN, IDM_EDIT_MOVE_UP, IDM_EDIT_PASTE, IDM_EDIT_REDO,
-    IDM_EDIT_SELECT_ALL, IDM_EDIT_UNDO, IDM_EDIT_UPPER, IDM_EOL_CRLF, IDM_EOL_LF, IDM_FILE_EXIT,
-    IDM_FILE_NEW, IDM_FILE_OPEN, IDM_FILE_RELOAD, IDM_FILE_SAVE, IDM_FILE_SAVEAS,
-    IDM_SEARCH_FIND, IDM_SEARCH_GOTO, IDM_SEARCH_NEXT, IDM_SEARCH_PREV, IDM_SEARCH_REPLACE,
-    IDM_VIEW_FONT, IDM_VIEW_LINENUM, IDM_VIEW_OUTLINE, IDM_VIEW_OUTLINE_REFRESH, IDM_VIEW_THEME,
+    IDM_EDIT_COMMENT, IDM_EDIT_COPY, IDM_EDIT_CUT, IDM_EDIT_DELETE, IDM_EDIT_DEL_LINE,
+    IDM_EDIT_DUP_LINE, IDM_EDIT_LOWER, IDM_EDIT_MOVE_DOWN, IDM_EDIT_MOVE_UP, IDM_EDIT_PASTE,
+    IDM_EDIT_REDO, IDM_EDIT_SELECT_ALL, IDM_EDIT_UNDO, IDM_EDIT_UPPER, IDM_EOL_CRLF, IDM_EOL_LF,
+    IDM_FILE_EXIT, IDM_FILE_NEW, IDM_FILE_OPEN, IDM_FILE_RELOAD, IDM_FILE_SAVE, IDM_FILE_SAVEAS,
+    IDM_OUTLINE_COLLAPSE_ALL, IDM_OUTLINE_EXPAND_ALL, IDM_SEARCH_FIND, IDM_SEARCH_GOTO,
+    IDM_SEARCH_NEXT, IDM_SEARCH_PREV, IDM_SEARCH_REPLACE, IDM_VIEW_FONT, IDM_VIEW_LINENUM,
+    IDM_VIEW_OUTLINE, IDM_VIEW_OUTLINE_REFRESH, IDM_VIEW_THEME_DARK, IDM_VIEW_THEME_LIGHT,
     IDM_VIEW_TOPMOST, IDM_VIEW_WHITESPACE, IDM_VIEW_WRAP, IDM_VIEW_ZOOM_IN, IDM_VIEW_ZOOM_OUT,
     IDM_VIEW_ZOOM_RESET,
 };
 
-const STATUS_BAR_HEIGHT: i32 = 24;
 const FIND_PANEL_W: i32 = 430;
 const FIND_PANEL_H: i32 = 108;
-const OUTLINE_HEADER_H: i32 = 30;
-const OUTLINE_ROW_H: i32 = 24;
 const CF_UNICODETEXT_ID: u32 = 13;
 const SS_CENTER: u32 = 1;
 
-// 悬浮查找替换面板子控件 ID
 const IDC_FIND_EDIT: i32 = 6001;
 const IDC_REPLACE_EDIT: i32 = 6002;
 const IDC_CHK_CASE: i32 = 6003;
@@ -49,136 +50,6 @@ const IDC_LBL_COUNT: i32 = 6011;
 const IDC_GOTO_EDIT: i32 = 6101;
 const IDC_GOTO_OK: i32 = 6102;
 const IDC_GOTO_CANCEL: i32 = 6103;
-
-// ============================================================================
-// 1. 主题配色与 Tab 制表位展开辅助
-// ============================================================================
-
-#[derive(Clone, Copy)]
-struct Theme {
-    bg: u32,
-    gutter_bg: u32,
-    gutter_fg: u32,
-    cur_line_bg: u32,
-    code_block_bg: u32,
-    inline_code_bg: u32,
-    sel_bg: u32,
-    match_bg: u32,
-    cur_match_bg: u32,
-    bracket_bg: u32,
-    text_fg: u32,
-    caret: u32,
-    ws_fg: u32,
-    status_bg: u32,
-    status_fg: u32,
-    status_border: u32,
-    outline_bg: u32,
-    outline_hdr_bg: u32,
-    outline_sel_bg: u32,
-    outline_btn_bg: u32,
-    outline_fg: u32,
-    outline_muted: u32,
-    kw_fg: u32,
-    h1_fg: u32,
-    h2_fg: u32,
-    str_fg: u32,
-    cmt_fg: u32,
-    num_fg: u32,
-    acc_fg: u32,
-    bold_fg: u32,
-    italic_fg: u32,
-    strike_fg: u32,
-    code_fg: u32,
-    alert_fg: u32,
-    task_done_fg: u32,
-    task_todo_fg: u32,
-}
-
-const fn rgb(r: u8, g: u8, b: u8) -> u32 {
-    (r as u32) | ((g as u32) << 8) | ((b as u32) << 16)
-}
-
-fn get_theme(dark: bool) -> Theme {
-    if dark {
-        Theme {
-            bg: rgb(30, 30, 30),
-            gutter_bg: rgb(35, 35, 37),
-            gutter_fg: rgb(125, 125, 125),
-            cur_line_bg: rgb(40, 43, 47),
-            code_block_bg: rgb(37, 39, 44),
-            inline_code_bg: rgb(52, 56, 64),
-            sel_bg: rgb(38, 79, 120),
-            match_bg: rgb(90, 70, 30),
-            cur_match_bg: rgb(160, 110, 30),
-            bracket_bg: rgb(65, 95, 65),
-            text_fg: rgb(216, 216, 216),
-            caret: rgb(240, 240, 240),
-            ws_fg: rgb(85, 85, 85),
-            status_bg: rgb(0, 122, 204),
-            status_fg: rgb(255, 255, 255),
-            status_border: rgb(50, 50, 54),
-            outline_bg: rgb(36, 37, 40),
-            outline_hdr_bg: rgb(45, 46, 50),
-            outline_sel_bg: rgb(55, 76, 102),
-            outline_btn_bg: rgb(60, 62, 68),
-            outline_fg: rgb(220, 220, 220),
-            outline_muted: rgb(145, 150, 160),
-            kw_fg: rgb(86, 156, 214),
-            h1_fg: rgb(97, 175, 239),
-            h2_fg: rgb(128, 203, 196),
-            str_fg: rgb(206, 145, 120),
-            cmt_fg: rgb(128, 168, 112),
-            num_fg: rgb(181, 206, 168),
-            acc_fg: rgb(140, 200, 245),
-            bold_fg: rgb(229, 192, 123),
-            italic_fg: rgb(198, 170, 221),
-            strike_fg: rgb(135, 135, 135),
-            code_fg: rgb(224, 158, 116),
-            alert_fg: rgb(255, 184, 108),
-            task_done_fg: rgb(115, 201, 145),
-            task_todo_fg: rgb(229, 192, 123),
-        }
-    } else {
-        Theme {
-            bg: rgb(255, 255, 255),
-            gutter_bg: rgb(246, 246, 248),
-            gutter_fg: rgb(130, 130, 130),
-            cur_line_bg: rgb(242, 247, 255),
-            code_block_bg: rgb(246, 248, 250),
-            inline_code_bg: rgb(235, 238, 242),
-            sel_bg: rgb(173, 214, 255),
-            match_bg: rgb(255, 235, 150),
-            cur_match_bg: rgb(255, 180, 70),
-            bracket_bg: rgb(205, 238, 205),
-            text_fg: rgb(32, 35, 40),
-            caret: rgb(0, 0, 0),
-            ws_fg: rgb(195, 195, 195),
-            status_bg: rgb(240, 242, 245),
-            status_fg: rgb(45, 48, 55),
-            status_border: rgb(215, 218, 222),
-            outline_bg: rgb(248, 249, 251),
-            outline_hdr_bg: rgb(238, 240, 244),
-            outline_sel_bg: rgb(214, 231, 250),
-            outline_btn_bg: rgb(226, 229, 235),
-            outline_fg: rgb(35, 38, 45),
-            outline_muted: rgb(115, 120, 130),
-            kw_fg: rgb(0, 92, 197),
-            h1_fg: rgb(9, 105, 218),
-            h2_fg: rgb(5, 118, 126),
-            str_fg: rgb(163, 21, 21),
-            cmt_fg: rgb(87, 122, 92),
-            num_fg: rgb(9, 134, 88),
-            acc_fg: rgb(4, 81, 165),
-            bold_fg: rgb(149, 56, 0),
-            italic_fg: rgb(130, 80, 223),
-            strike_fg: rgb(145, 150, 158),
-            code_fg: rgb(164, 53, 30),
-            alert_fg: rgb(188, 76, 0),
-            task_done_fg: rgb(26, 127, 55),
-            task_todo_fg: rgb(154, 103, 0),
-        }
-    }
-}
 
 #[inline]
 fn loword(v: usize) -> u16 {
@@ -201,71 +72,6 @@ fn key_down(vk: u16) -> bool {
     unsafe { (GetKeyState(vk as i32) as u16 & 0x8000) != 0 }
 }
 
-fn expand_tabs_col(s: &str, start_col: usize, show_ws: bool) -> (String, usize) {
-    let mut out = String::with_capacity(s.len() + 8);
-    let mut col = start_col;
-    for ch in s.chars() {
-        if ch == '\t' {
-            let spaces = 4 - (col % 4);
-            if show_ws {
-                out.push('→');
-                for _ in 1..spaces {
-                    out.push(' ');
-                }
-            } else {
-                for _ in 0..spaces {
-                    out.push(' ');
-                }
-            }
-            col += spaces;
-        } else if ch == ' ' && show_ws {
-            out.push('·');
-            col += 1;
-        } else {
-            out.push(ch);
-            col += if (ch as u32) > 0x7F { 2 } else { 1 };
-        }
-    }
-    (out, col)
-}
-
-/// 展开 Tab 并建立 UTF-16 索引到原切片 UTF-8 字节偏移的映射
-fn expand_tabs_with_u16_map(s: &str, half_snap: bool) -> (String, Vec<usize>) {
-    let mut out = String::with_capacity(s.len() + 8);
-    let mut map = Vec::with_capacity(s.len() + 4);
-    let mut col = 0usize;
-    for (b_idx, ch) in s.char_indices() {
-        if ch == '\t' {
-            let spaces = 4 - (col % 4);
-            for k in 0..spaces {
-                out.push(' ');
-                if half_snap && k >= spaces / 2 {
-                    map.push(b_idx + 1);
-                } else {
-                    map.push(b_idx);
-                }
-            }
-            col += spaces;
-        } else {
-            let u16_len = ch.len_utf16();
-            out.push(ch);
-            for _ in 0..u16_len {
-                map.push(b_idx);
-            }
-            col += if (ch as u32) > 0x7F { 2 } else { 1 };
-        }
-    }
-    map.push(s.len());
-    (out, map)
-}
-
-#[derive(Clone, Copy)]
-pub struct VisualSeg {
-    pub line: usize,
-    pub b_start: usize,
-    pub b_end: usize,
-}
-
 pub struct AppState {
     pub hwnd: HWND,
     pub hfont_regular: HFONT,
@@ -274,6 +80,8 @@ pub struct AppState {
     pub hfont_strike: HFONT,
     pub hfont_ui: HFONT,
     pub hfont_ui_bold: HFONT,
+    pub find_bg_brush: HBRUSH,
+    pub find_edit_brush: HBRUSH,
     pub doc: Document,
     pub cfg: AppConfig,
     pub search: SearchState,
@@ -287,6 +95,7 @@ pub struct AppState {
 
     pub scroll_y: usize,
     pub scroll_x: i32,
+    pub last_wrap_px: i32,
     pub line_wraps: Vec<Vec<(usize, usize)>>,
     pub visual_prefix: Vec<usize>,
 
@@ -312,6 +121,20 @@ pub struct AppState {
 impl AppState {
     fn effective_font_px(&self) -> i32 {
         ((self.cfg.font_size * self.cfg.zoom_pct) / 100).clamp(8, 72)
+    }
+
+    pub fn rebuild_theme_brushes(&mut self) {
+        let theme = get_theme(self.cfg.dark_theme);
+        unsafe {
+            if !self.find_bg_brush.is_null() {
+                DeleteObject(self.find_bg_brush as _);
+            }
+            if !self.find_edit_brush.is_null() {
+                DeleteObject(self.find_edit_brush as _);
+            }
+            self.find_bg_brush = CreateSolidBrush(theme.outline_hdr_bg);
+            self.find_edit_brush = CreateSolidBrush(theme.bg);
+        }
     }
 
     pub fn recreate_fonts(&mut self) {
@@ -359,7 +182,7 @@ impl AppState {
         self.rebuild_all_wraps();
     }
 
-    fn update_gutter_width(&mut self) {
+    pub fn update_gutter_width(&mut self) {
         if !self.cfg.show_line_numbers {
             self.gutter_w = 14;
             return;
@@ -368,7 +191,7 @@ impl AppState {
         self.gutter_w = (digits as i32 * self.avg_char_w) + 22;
     }
 
-    fn outline_panel_width(&self) -> i32 {
+    pub fn outline_panel_width(&self) -> i32 {
         if self.cfg.outline_visible && self.client_w > 460 {
             self.cfg.outline_width.clamp(180, (self.client_w / 2).max(180))
         } else {
@@ -376,106 +199,24 @@ impl AppState {
         }
     }
 
-    fn editor_right(&self) -> i32 {
+    pub fn editor_right(&self) -> i32 {
         (self.client_w - self.outline_panel_width()).max(140)
     }
 
-    fn editor_height(&self) -> i32 {
+    pub fn editor_height(&self) -> i32 {
         (self.client_h - STATUS_BAR_HEIGHT).max(self.line_h)
     }
 
-    fn visible_row_count(&self) -> usize {
+    pub fn visible_row_count(&self) -> usize {
         ((self.editor_height() / self.line_h.max(1)).max(1)) as usize
     }
 
-    fn wrap_active(&self) -> bool {
+    pub fn wrap_active(&self) -> bool {
         self.cfg.word_wrap && !self.doc.large_mode
     }
 
     fn wrap_max_px(&self) -> i32 {
-        (self.editor_right() - self.gutter_w - 22).max(self.avg_char_w * 8)
-    }
-
-    fn compute_line_wraps_with_dc(&self, hdc: HDC, line_str: &str, max_px: i32) -> Vec<(usize, usize)> {
-        if line_str.is_empty() {
-            return vec![(0, 0)];
-        }
-        if line_str.len() > 16_384 {
-            let mut segs = Vec::new();
-            let mut s = 0usize;
-            while s < line_str.len() {
-                let e = line_str[s..]
-                    .char_indices()
-                    .nth(120)
-                    .map(|(i, _)| s + i)
-                    .unwrap_or(line_str.len());
-                segs.push((s, e));
-                s = e;
-            }
-            return segs;
-        }
-
-        let mut segs = Vec::new();
-        let mut seg_start = 0usize;
-        let base_chars = ((max_px / (self.avg_char_w / 2).max(3)) as usize + 48).max(64);
-
-        while seg_start < line_str.len() {
-            let rem = &line_str[seg_start..];
-            let mut chunk_chars = base_chars;
-            let (chunk, fit, u16_len, map) = loop {
-                let chunk_end = rem
-                    .char_indices()
-                    .nth(chunk_chars)
-                    .map(|(i, _)| i)
-                    .unwrap_or(rem.len());
-                let ch_slice = &rem[..chunk_end];
-                let (exp, map) = expand_tabs_with_u16_map(ch_slice, false);
-                let w = to_wide(&exp);
-                let u16_len = (w.len() - 1) as i32;
-                let mut fit: i32 = 0;
-                let mut sz: SIZE = unsafe { std::mem::zeroed() };
-                unsafe {
-                    GetTextExtentExPointW(hdc, w.as_ptr(), u16_len, max_px, &mut fit, null_mut(), &mut sz);
-                }
-                if fit == u16_len && chunk_end < rem.len() {
-                    chunk_chars *= 2;
-                    continue;
-                }
-                break (ch_slice, fit.max(0) as usize, u16_len as usize, map);
-            };
-
-            if fit >= u16_len && chunk.len() == rem.len() {
-                segs.push((seg_start, line_str.len()));
-                break;
-            }
-
-            let mut split_rel = map[fit.min(map.len() - 1)];
-            if split_rel == 0 {
-                split_rel = rem.chars().next().map(|c| c.len_utf8()).unwrap_or(1);
-            } else if split_rel < chunk.len() {
-                let cb = chunk.as_bytes();
-                let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
-                if is_word(cb[split_rel - 1]) && is_word(cb[split_rel]) {
-                    let min_keep = split_rel / 3;
-                    let mut bp = split_rel;
-                    while bp > min_keep {
-                        if !chunk.is_char_boundary(bp) {
-                            bp -= 1;
-                            continue;
-                        }
-                        let prev = cb[bp - 1];
-                        if matches!(prev, b' ' | b'\t' | b'-' | b'/' | b',' | b';' | b'.') || prev >= 0x80 {
-                            split_rel = bp;
-                            break;
-                        }
-                        bp -= 1;
-                    }
-                }
-            }
-            segs.push((seg_start, seg_start + split_rel));
-            seg_start += split_rel;
-        }
-        segs
+        (self.editor_right() - self.gutter_w - 30).max(self.avg_char_w * 6)
     }
 
     fn rebuild_visual_prefix(&mut self) {
@@ -489,22 +230,37 @@ impl AppState {
         }
     }
 
-    fn rebuild_all_wraps(&mut self) {
+    pub fn rebuild_all_wraps(&mut self) {
         self.doc.wrap_patches.clear();
         self.line_wraps.clear();
         if !self.wrap_active() {
             self.visual_prefix.clear();
+            self.last_wrap_px = 0;
+            return;
+        }
+        if self.client_w <= 60 {
             return;
         }
         let max_px = self.wrap_max_px();
+        self.last_wrap_px = max_px;
         let count = self.doc.line_count();
         self.line_wraps.reserve(count);
+        let is_md = self.doc.lang == Lang::Markdown;
         unsafe {
             let hdc = GetDC(self.hwnd);
             let old = SelectObject(hdc, self.hfont_regular as _);
             for l in 0..count {
                 let s = self.doc.line_str(l);
-                self.line_wraps.push(self.compute_line_wraps_with_dc(hdc, s, max_px));
+                self.line_wraps.push(compute_line_wraps_with_dc(
+                    hdc,
+                    s,
+                    max_px,
+                    self.avg_char_w,
+                    self.cfg.show_whitespace,
+                    self.hfont_regular,
+                    self.hfont_bold,
+                    is_md,
+                ));
             }
             SelectObject(hdc, old);
             ReleaseDC(self.hwnd, hdc);
@@ -512,19 +268,20 @@ impl AppState {
         self.rebuild_visual_prefix();
     }
 
-    fn sync_wraps_after_edit(&mut self) {
+    pub fn sync_wraps_after_edit(&mut self) {
         let patches: Vec<(usize, usize, usize)> = self.doc.wrap_patches.drain(..).collect();
         if !self.wrap_active() {
+            return;
+        }
+        let max_px = self.wrap_max_px();
+        if self.line_wraps.is_empty() || max_px != self.last_wrap_px {
+            self.rebuild_all_wraps();
             return;
         }
         if patches.is_empty() && self.line_wraps.len() == self.doc.line_count() {
             return;
         }
-        if self.line_wraps.is_empty() {
-            self.rebuild_all_wraps();
-            return;
-        }
-        let max_px = self.wrap_max_px();
+        let is_md = self.doc.lang == Lang::Markdown;
         unsafe {
             let hdc = GetDC(self.hwnd);
             let old = SelectObject(hdc, self.hfont_regular as _);
@@ -541,7 +298,16 @@ impl AppState {
                         break;
                     }
                     let s = self.doc.line_str(l);
-                    rep_wraps.push(self.compute_line_wraps_with_dc(hdc, s, max_px));
+                    rep_wraps.push(compute_line_wraps_with_dc(
+                        hdc,
+                        s,
+                        max_px,
+                        self.avg_char_w,
+                        self.cfg.show_whitespace,
+                        self.hfont_regular,
+                        self.hfont_bold,
+                        is_md,
+                    ));
                 }
                 self.line_wraps.splice(start_line..(start_line + old_count), rep_wraps);
             }
@@ -555,7 +321,7 @@ impl AppState {
         }
     }
 
-    fn total_visual_lines(&self) -> usize {
+    pub fn total_visual_lines(&self) -> usize {
         if self.wrap_active() {
             self.visual_prefix.last().copied().unwrap_or(1).max(1)
         } else {
@@ -563,7 +329,7 @@ impl AppState {
         }
     }
 
-    fn get_visual_seg(&self, vrow: usize) -> Option<VisualSeg> {
+    pub fn get_visual_seg(&self, vrow: usize) -> Option<VisualSeg> {
         if self.wrap_active() {
             let total = self.total_visual_lines();
             if vrow >= total || self.line_wraps.is_empty() {
@@ -581,7 +347,7 @@ impl AppState {
         }
     }
 
-    fn byte_to_visual_row(&self, byte_pos: usize) -> usize {
+    pub fn byte_to_visual_row(&self, byte_pos: usize) -> usize {
         let line = self.doc.line_of_byte(byte_pos);
         if !self.wrap_active() {
             return line;
@@ -682,7 +448,7 @@ impl AppState {
         if slice.len() > 8192 {
             return (slice.len() as i32) * self.avg_char_w;
         }
-        let (expanded, _) = expand_tabs_col(slice, 0, false);
+        let (expanded, _) = expand_tabs_col(slice, 0, self.cfg.show_whitespace);
         let w = to_wide(&expanded);
         unsafe {
             let hdc = GetDC(self.hwnd);
@@ -714,7 +480,7 @@ impl AppState {
             return (abs, seg.line, col);
         }
 
-        let (expanded, map) = expand_tabs_with_u16_map(seg_str, true);
+        let (expanded, map) = expand_tabs_with_u16_map(seg_str, self.cfg.show_whitespace, true);
         let w = to_wide(&expanded);
         let u16_len = (w.len() - 1) as i32;
         let mut fit: i32 = 0;
@@ -912,7 +678,6 @@ impl AppState {
                 if old_lang != self.doc.lang {
                     self.doc.rebuild_all_line_states();
                 }
-                // 非实时刷新：保存时若大纲栏开启则刷新大纲
                 if self.cfg.outline_visible {
                     self.outline.refresh_from_doc(&self.doc);
                 }
@@ -930,479 +695,7 @@ impl AppState {
 }
 
 // ============================================================================
-// 2. 双缓冲 GDI 虚拟滚动渲染器（编辑区 + 右侧 MD 大纲栏 + 状态栏）
-// ============================================================================
-
-fn find_matching_bracket(doc: &Document, pos: usize) -> Option<(usize, usize)> {
-    let bytes = doc.text.as_bytes();
-    let check_at = |idx: usize| -> Option<(usize, u8, u8, bool)> {
-        if idx >= bytes.len() {
-            return None;
-        }
-        match bytes[idx] {
-            b'(' => Some((idx, b'(', b')', true)),
-            b'[' => Some((idx, b'[', b']', true)),
-            b'{' => Some((idx, b'{', b'}', true)),
-            b')' => Some((idx, b')', b'(', false)),
-            b']' => Some((idx, b']', b'[', false)),
-            b'}' => Some((idx, b'}', b'{', false)),
-            _ => None,
-        }
-    };
-    let (start, open_b, close_b, forward) = check_at(pos).or_else(|| {
-        if pos > 0 { check_at(pos - 1) } else { None }
-    })?;
-
-    let mut depth = 0i32;
-    let limit = 15_000usize;
-    if forward {
-        let end = (start + limit).min(bytes.len());
-        for i in start..end {
-            if bytes[i] == open_b {
-                depth += 1;
-            } else if bytes[i] == close_b {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((start, i));
-                }
-            }
-        }
-    } else {
-        let begin = start.saturating_sub(limit);
-        for i in (begin..=start).rev() {
-            if bytes[i] == open_b {
-                depth += 1;
-            } else if bytes[i] == close_b {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((i, start));
-                }
-            }
-        }
-    }
-    None
-}
-
-fn paint_outline_panel(state: &AppState, mem_dc: HDC, theme: Theme, left: i32, right: i32, bottom: i32) {
-    unsafe {
-        let bg_br = CreateSolidBrush(theme.outline_bg);
-        let rc = RECT { left, top: 0, right, bottom };
-        FillRect(mem_dc, &rc, bg_br);
-        DeleteObject(bg_br as _);
-
-        let hdr_br = CreateSolidBrush(theme.outline_hdr_bg);
-        let hrc = RECT { left, top: 0, right, bottom: OUTLINE_HEADER_H };
-        FillRect(mem_dc, &hrc, hdr_br);
-        DeleteObject(hdr_br as _);
-
-        let sep_br = CreateSolidBrush(theme.status_border);
-        let v_sep = RECT { left, top: 0, right: left + 1, bottom };
-        FillRect(mem_dc, &v_sep, sep_br);
-        let h_sep = RECT { left, top: OUTLINE_HEADER_H - 1, right, bottom: OUTLINE_HEADER_H };
-        FillRect(mem_dc, &h_sep, sep_br);
-        DeleteObject(sep_br as _);
-
-        SelectObject(mem_dc, state.hfont_ui_bold as _);
-        SetTextColor(mem_dc, theme.outline_fg);
-        let title_w = to_wide("Markdown 大纲");
-        let mut trc = RECT { left: left + 10, top: 6, right: right - 115, bottom: OUTLINE_HEADER_H - 2 };
-        DrawTextW(mem_dc, title_w.as_ptr(), (title_w.len() - 1) as i32, &mut trc, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-
-        // 顶部按钮：[刷新] [全展] [全折] [×]
-        SelectObject(mem_dc, state.hfont_ui as _);
-        let btn_br = CreateSolidBrush(theme.outline_btn_bg);
-        let btns = [
-            (right - 112, right - 76, "刷新"),
-            (right - 72, right - 42, "展"),
-            (right - 38, right - 22, "折"),
-            (right - 18, right - 4, "×"),
-        ];
-        for (bx1, bx2, label) in btns {
-            let brc = RECT { left: bx1, top: 5, right: bx2, bottom: OUTLINE_HEADER_H - 5 };
-            FillRect(mem_dc, &brc, btn_br);
-            let wl = to_wide(label);
-            let mut lrc = brc;
-            DrawTextW(mem_dc, wl.as_ptr(), (wl.len() - 1) as i32, &mut lrc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-        }
-        DeleteObject(btn_br as _);
-
-        let vis = state.outline.visible_indices();
-        if vis.is_empty() {
-            SetTextColor(mem_dc, theme.outline_muted);
-            let empty_w = to_wide("无标题节点\n(点击右上角[刷新]解析)");
-            let mut erc = RECT { left: left + 10, top: OUTLINE_HEADER_H + 18, right: right - 10, bottom: bottom - 10 };
-            DrawTextW(mem_dc, empty_w.as_ptr(), (empty_w.len() - 1) as i32, &mut erc, DT_CENTER | DT_WORDBREAK);
-            return;
-        }
-
-        let clip = CreateRectRgn(left + 1, OUTLINE_HEADER_H, right, bottom);
-        SelectClipRgn(mem_dc, clip);
-        let sel_br = CreateSolidBrush(theme.outline_sel_bg);
-        let max_rows = ((bottom - OUTLINE_HEADER_H) / OUTLINE_ROW_H + 1) as usize;
-
-        for r in 0..max_rows {
-            let vidx = state.outline.scroll_row + r;
-            if vidx >= vis.len() {
-                break;
-            }
-            let node_idx = vis[vidx];
-            let node = &state.outline.nodes[node_idx];
-            let y = OUTLINE_HEADER_H + (r as i32) * OUTLINE_ROW_H;
-            if state.outline.selected_idx == Some(node_idx) {
-                let s_rc = RECT { left: left + 2, top: y + 1, right: right - 2, bottom: y + OUTLINE_ROW_H - 1 };
-                FillRect(mem_dc, &s_rc, sel_br);
-            }
-
-            let indent = 10 + (node.level.saturating_sub(1) as i32) * 14;
-            if node.has_children {
-                SetTextColor(mem_dc, theme.outline_muted);
-                let arrow = to_wide(if node.collapsed { "▸" } else { "▾" });
-                let mut arc = RECT { left: left + indent - 2, top: y + 3, right: left + indent + 14, bottom: y + OUTLINE_ROW_H };
-                DrawTextW(mem_dc, arrow.as_ptr(), (arrow.len() - 1) as i32, &mut arc, DT_LEFT | DT_SINGLELINE);
-            }
-
-            if node.level <= 2 {
-                SelectObject(mem_dc, state.hfont_ui_bold as _);
-                SetTextColor(mem_dc, if node.level == 1 { theme.h1_fg } else { theme.h2_fg });
-            } else {
-                SelectObject(mem_dc, state.hfont_ui as _);
-                SetTextColor(mem_dc, theme.outline_fg);
-            }
-            let wt = to_wide(&node.title);
-            let mut nrc = RECT {
-                left: left + indent + 14,
-                top: y + 3,
-                right: right - 6,
-                bottom: y + OUTLINE_ROW_H,
-            };
-            DrawTextW(mem_dc, wt.as_ptr(), (wt.len() - 1) as i32, &mut nrc, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
-        }
-
-        DeleteObject(sel_br as _);
-        SelectClipRgn(mem_dc, null_mut());
-        DeleteObject(clip as _);
-    }
-}
-
-fn paint_editor(state: &AppState, hdc_win: HDC) {
-    let w = state.client_w.max(1);
-    let h = state.client_h.max(1);
-    let edit_r = state.editor_right();
-    let edit_b = h - STATUS_BAR_HEIGHT;
-    let theme = get_theme(state.cfg.dark_theme);
-
-    unsafe {
-        let mem_dc = CreateCompatibleDC(hdc_win);
-        let bmp = CreateCompatibleBitmap(hdc_win, w, h);
-        let old_bmp = SelectObject(mem_dc, bmp as _);
-        let old_font = SelectObject(mem_dc, state.hfont_regular as _);
-        SetBkMode(mem_dc, TRANSPARENT as i32);
-
-        let bg_br = CreateSolidBrush(theme.bg);
-        let full_rc = RECT { left: 0, top: 0, right: edit_r, bottom: edit_b };
-        FillRect(mem_dc, &full_rc, bg_br);
-        DeleteObject(bg_br as _);
-
-        let gut_br = CreateSolidBrush(theme.gutter_bg);
-        let gut_rc = RECT { left: 0, top: 0, right: state.gutter_w, bottom: edit_b };
-        FillRect(mem_dc, &gut_rc, gut_br);
-        DeleteObject(gut_br as _);
-
-        let cur_line = state.doc.line_of_byte(state.doc.primary().head);
-        let bracket_pair = if !state.doc.large_mode {
-            find_matching_bracket(&state.doc, state.doc.primary().head)
-        } else {
-            None
-        };
-
-        let clip_rgn = CreateRectRgn(state.gutter_w, 0, edit_r, edit_b);
-        let vis_rows = state.visible_row_count() + 1;
-        let cur_line_br = CreateSolidBrush(theme.cur_line_bg);
-        let code_blk_br = CreateSolidBrush(theme.code_block_bg);
-        let inline_code_br = CreateSolidBrush(theme.inline_code_bg);
-        let quote_bar_br = CreateSolidBrush(theme.acc_fg);
-        let sel_br = CreateSolidBrush(theme.sel_bg);
-        let match_br = CreateSolidBrush(theme.match_bg);
-        let cur_match_br = CreateSolidBrush(theme.cur_match_bg);
-        let brk_br = CreateSolidBrush(theme.bracket_bg);
-        let caret_br = CreateSolidBrush(theme.caret);
-        let hr_pen = CreatePen(PS_SOLID as i32, 1, theme.ws_fg);
-
-        let mut last_drawn_logical = usize::MAX;
-        let text_left = state.gutter_w + 8 - state.scroll_x;
-        let active_lang = if state.doc.large_mode { Lang::Plain } else { state.doc.lang };
-
-        for r in 0..vis_rows {
-            let vrow = state.scroll_y + r;
-            let Some(seg) = state.get_visual_seg(vrow) else {
-                break;
-            };
-            let y = (r as i32) * state.line_h;
-            if y >= edit_b {
-                break;
-            }
-
-            let line_state = state.doc.line_states.get(seg.line).copied().unwrap_or(LineState::Normal);
-            let full_line = state.doc.line_str(seg.line);
-            let (tokens, line_attr) = if full_line.len() <= 8192 {
-                highlight_line_with_state(active_lang, full_line, line_state)
-            } else {
-                (Vec::new(), LineAttr::default())
-            };
-
-            if line_attr.is_code_block {
-                let cb_rc = RECT { left: state.gutter_w, top: y, right: edit_r, bottom: y + state.line_h };
-                FillRect(mem_dc, &cb_rc, code_blk_br);
-            }
-            if seg.line == cur_line {
-                let row_rc = RECT { left: state.gutter_w, top: y, right: edit_r, bottom: y + state.line_h };
-                FillRect(mem_dc, &row_rc, cur_line_br);
-            }
-            if line_attr.is_quote {
-                let q_rc = RECT { left: state.gutter_w + 2, top: y + 1, right: state.gutter_w + 5, bottom: y + state.line_h - 1 };
-                FillRect(mem_dc, &q_rc, quote_bar_br);
-            }
-
-            if state.cfg.show_line_numbers && seg.line != last_drawn_logical {
-                SelectObject(mem_dc, state.hfont_regular as _);
-                SetTextColor(mem_dc, if seg.line == cur_line { theme.text_fg } else { theme.gutter_fg });
-                let num_s = to_wide(&(seg.line + 1).to_string());
-                let mut nrc = RECT { left: 2, top: y + 2, right: state.gutter_w - 8, bottom: y + state.line_h };
-                DrawTextW(mem_dc, num_s.as_ptr(), (num_s.len() - 1) as i32, &mut nrc, DT_RIGHT | DT_SINGLELINE);
-            }
-            last_drawn_logical = seg.line;
-
-            SelectClipRgn(mem_dc, clip_rgn);
-
-            if line_attr.is_hr && seg.b_start == 0 {
-                let old_pen = SelectObject(mem_dc, hr_pen as _);
-                let hy = y + state.line_h / 2;
-                MoveToEx(mem_dc, state.gutter_w + 8, hy, null_mut());
-                LineTo(mem_dc, edit_r - 12, hy);
-                SelectObject(mem_dc, old_pen);
-            }
-
-            let line_abs_start = state.doc.line_starts[seg.line];
-            let seg_abs_start = line_abs_start + seg.b_start;
-            let seg_abs_end = line_abs_start + seg.b_end;
-            let seg_str = &full_line[seg.b_start..seg.b_end];
-
-            let draw_slice = if seg_str.len() > 16_384 {
-                let mut e = 16_384;
-                while !seg_str.is_char_boundary(e) {
-                    e -= 1;
-                }
-                &seg_str[..e]
-            } else {
-                seg_str
-            };
-
-            let seg_x = |abs_byte: usize| -> i32 {
-                let rel = abs_byte.saturating_sub(seg_abs_start).min(draw_slice.len());
-                let sub = &draw_slice[..rel];
-                if sub.is_empty() {
-                    return text_left;
-                }
-                let (exp, _) = expand_tabs_col(sub, 0, false);
-                let ew = to_wide(&exp);
-                let mut sz: SIZE = std::mem::zeroed();
-                SelectObject(mem_dc, state.hfont_regular as _);
-                GetTextExtentPoint32W(mem_dc, ew.as_ptr(), (ew.len() - 1) as i32, &mut sz);
-                text_left + sz.cx
-            };
-
-            if state.search.visible && !state.search.matches.is_empty() {
-                let lo = state.search.matches.partition_point(|m| m.1 <= seg_abs_start);
-                for idx in lo..state.search.matches.len() {
-                    let (ms, me) = state.search.matches[idx];
-                    if ms >= seg_abs_end {
-                        break;
-                    }
-                    let xs = seg_x(ms.max(seg_abs_start));
-                    let xe = seg_x(me.min(seg_abs_end));
-                    let mrc = RECT { left: xs, top: y, right: xe.max(xs + 2), bottom: y + state.line_h };
-                    FillRect(mem_dc, &mrc, if state.search.current_idx == Some(idx) { cur_match_br } else { match_br });
-                }
-            }
-
-            if let Some((b1, b2)) = bracket_pair {
-                for bp in [b1, b2] {
-                    if bp >= seg_abs_start && bp < seg_abs_end {
-                        let xs = seg_x(bp);
-                        let xe = seg_x(bp + 1);
-                        let brc = RECT { left: xs, top: y, right: xe, bottom: y + state.line_h };
-                        FillRect(mem_dc, &brc, brk_br);
-                    }
-                }
-            }
-
-            for c in &state.doc.cursors {
-                let (cs, ce) = c.range();
-                if cs < ce && ce > seg_abs_start && cs <= seg_abs_end {
-                    let xs = seg_x(cs.max(seg_abs_start));
-                    let mut xe = seg_x(ce.min(seg_abs_end));
-                    if ce > seg_abs_end {
-                        xe += state.avg_char_w / 2;
-                    }
-                    let src = RECT { left: xs, top: y, right: xe.max(xs + 2), bottom: y + state.line_h };
-                    FillRect(mem_dc, &src, sel_br);
-                }
-            }
-
-            let mut cur_x = text_left;
-            let mut cur_col = 0usize;
-            let mut pos = 0usize;
-            let draw_chunk = |chunk: &str, color: u32, font: HFONT, inline_bg: bool, x_acc: &mut i32, col_acc: &mut usize| {
-                if chunk.is_empty() {
-                    return;
-                }
-                let (shown, next_col) = expand_tabs_col(chunk, *col_acc, state.cfg.show_whitespace);
-                *col_acc = next_col;
-                let wtxt = to_wide(&shown);
-                let clen = (wtxt.len() - 1) as i32;
-                SelectObject(mem_dc, font as _);
-                let mut sz: SIZE = std::mem::zeroed();
-                GetTextExtentPoint32W(mem_dc, wtxt.as_ptr(), clen, &mut sz);
-                if inline_bg {
-                    let irc = RECT { left: *x_acc, top: y + 2, right: *x_acc + sz.cx, bottom: y + state.line_h - 2 };
-                    FillRect(mem_dc, &irc, inline_code_br);
-                }
-                if state.cfg.show_whitespace && chunk.chars().all(|ch| ch == ' ' || ch == '\t') {
-                    SetTextColor(mem_dc, theme.ws_fg);
-                } else {
-                    SetTextColor(mem_dc, color);
-                }
-                TextOutW(mem_dc, *x_acc, y + 3, wtxt.as_ptr(), clen);
-                *x_acc += sz.cx;
-            };
-
-            let seg_end_rel = seg.b_start + draw_slice.len();
-            for (ts, te, kind) in tokens {
-                if te <= seg.b_start || ts >= seg_end_rel {
-                    continue;
-                }
-                let ls = ts.saturating_sub(seg.b_start);
-                let le = te.min(seg_end_rel) - seg.b_start;
-                if ls > pos {
-                    draw_chunk(&draw_slice[pos..ls], theme.text_fg, state.hfont_regular, false, &mut cur_x, &mut cur_col);
-                }
-                let (tcol, tfont, has_bg) = match kind {
-                    TokenKind::Keyword => (theme.kw_fg, state.hfont_regular, false),
-                    TokenKind::Heading1 => (theme.h1_fg, state.hfont_bold, false),
-                    TokenKind::Heading2 => (theme.h2_fg, state.hfont_bold, false),
-                    TokenKind::StringLit => (theme.str_fg, state.hfont_regular, false),
-                    TokenKind::Comment => (theme.cmt_fg, state.hfont_regular, false),
-                    TokenKind::Number => (theme.num_fg, state.hfont_regular, false),
-                    TokenKind::Accent => (theme.acc_fg, state.hfont_regular, false),
-                    TokenKind::Bold => (theme.bold_fg, state.hfont_bold, false),
-                    TokenKind::Italic => (theme.italic_fg, state.hfont_italic, false),
-                    TokenKind::Strike => (theme.strike_fg, state.hfont_strike, false),
-                    TokenKind::InlineCode => (theme.code_fg, state.hfont_regular, !line_attr.is_code_block),
-                    TokenKind::AlertTag => (theme.alert_fg, state.hfont_bold, true),
-                    TokenKind::TaskDone => (theme.task_done_fg, state.hfont_bold, false),
-                    TokenKind::TaskTodo => (theme.task_todo_fg, state.hfont_bold, false),
-                };
-                if le > ls {
-                    draw_chunk(&draw_slice[ls..le], tcol, tfont, has_bg, &mut cur_x, &mut cur_col);
-                }
-                pos = pos.max(le);
-            }
-            if pos < draw_slice.len() {
-                draw_chunk(&draw_slice[pos..], theme.text_fg, state.hfont_regular, false, &mut cur_x, &mut cur_col);
-            }
-
-            for c in &state.doc.cursors {
-                let in_seg = if seg.b_end == full_line.len() {
-                    c.head >= seg_abs_start && c.head <= seg_abs_end
-                } else {
-                    c.head >= seg_abs_start && c.head < seg_abs_end
-                };
-                if in_seg {
-                    let cx = seg_x(c.head);
-                    let crc = RECT { left: cx, top: y + 2, right: cx + 2, bottom: y + state.line_h - 2 };
-                    FillRect(mem_dc, &crc, caret_br);
-                }
-            }
-
-            SelectClipRgn(mem_dc, null_mut());
-        }
-
-        DeleteObject(clip_rgn as _);
-        DeleteObject(cur_line_br as _);
-        DeleteObject(code_blk_br as _);
-        DeleteObject(inline_code_br as _);
-        DeleteObject(quote_bar_br as _);
-        DeleteObject(sel_br as _);
-        DeleteObject(match_br as _);
-        DeleteObject(cur_match_br as _);
-        DeleteObject(brk_br as _);
-        DeleteObject(caret_br as _);
-        DeleteObject(hr_pen as _);
-
-        if edit_r < w {
-            paint_outline_panel(state, mem_dc, theme, edit_r, w, edit_b);
-        }
-
-        // 底部紧凑状态栏
-        let sb_top = h - STATUS_BAR_HEIGHT;
-        let sb_br = CreateSolidBrush(theme.status_bg);
-        let sb_rc = RECT { left: 0, top: sb_top, right: w, bottom: h };
-        FillRect(mem_dc, &sb_rc, sb_br);
-        DeleteObject(sb_br as _);
-
-        let bd_br = CreateSolidBrush(theme.status_border);
-        let bd_rc = RECT { left: 0, top: sb_top, right: w, bottom: sb_top + 1 };
-        FillRect(mem_dc, &bd_rc, bd_br);
-        DeleteObject(bd_br as _);
-
-        SelectObject(mem_dc, state.hfont_ui as _);
-        SetTextColor(mem_dc, theme.status_fg);
-
-        let (cline, ccol) = state.doc.byte_to_line_col(state.doc.primary().head);
-        let sel_cnt = state.doc.selected_char_count();
-        let multi_tag = if state.doc.cursors.len() > 1 {
-            format!("  |  多光标: {}", state.doc.cursors.len())
-        } else {
-            String::new()
-        };
-        let large_tag = if state.doc.large_mode { "  [大文件极速]" } else { "" };
-        let left_info = format!(
-            "  行 {} / {}   列 {}   选中 {}{}{}",
-            cline + 1,
-            state.doc.line_count(),
-            ccol + 1,
-            sel_cnt,
-            multi_tag,
-            large_tag
-        );
-        let mode_tag = if state.doc.lang == Lang::Markdown { "Markdown/GFM" } else { "代码高亮" };
-        let right_info = format!(
-            "字数 {}   |   {}   |   {}   |   {}   |   {}%  ",
-            state.doc.total_chars,
-            mode_tag,
-            state.doc.encoding.label(),
-            state.doc.line_ending.label(),
-            state.cfg.zoom_pct
-        );
-
-        let wl = to_wide(&left_info);
-        let mut lrc = RECT { left: 4, top: sb_top + 3, right: w / 2 + 80, bottom: h };
-        DrawTextW(mem_dc, wl.as_ptr(), (wl.len() - 1) as i32, &mut lrc, DT_LEFT | DT_SINGLELINE);
-
-        let wr = to_wide(&right_info);
-        let mut rrc = RECT { left: w / 3, top: sb_top + 3, right: w - 6, bottom: h };
-        DrawTextW(mem_dc, wr.as_ptr(), (wr.len() - 1) as i32, &mut rrc, DT_RIGHT | DT_SINGLELINE);
-
-        SelectObject(mem_dc, old_font);
-        BitBlt(hdc_win, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
-        SelectObject(mem_dc, old_bmp);
-        DeleteObject(bmp as _);
-        DeleteDC(mem_dc);
-    }
-}
-
-// ============================================================================
-// 3. 剪贴板、系统原生打开/保存/字体对话框
+// 剪贴板与系统文件/字体对话框
 // ============================================================================
 
 fn clipboard_copy(hwnd: HWND, text: &str) {
@@ -1520,7 +813,75 @@ fn dialog_choose_font(state: &mut AppState) {
 }
 
 // ============================================================================
-// 4. 菜单状态同步、悬浮查找面板、转到行弹窗与快捷键分发
+// 右键上下文菜单（编辑区 + 大纲栏）
+// ============================================================================
+
+fn show_editor_context_menu(state: &AppState, mx: i32, my: i32) {
+    unsafe {
+        let menu = CreatePopupMenu();
+        let add = |id: usize, label: &str, enabled: bool, checked: bool| {
+            let w = to_wide(label);
+            let mut flags = MF_STRING;
+            if !enabled {
+                flags |= MF_GRAYED;
+            }
+            if checked {
+                flags |= MF_CHECKED;
+            }
+            AppendMenuW(menu, flags, id, w.as_ptr());
+        };
+        let has_sel = state.doc.has_any_selection();
+        let can_paste = IsClipboardFormatAvailable(CF_UNICODETEXT_ID) != 0;
+
+        add(IDM_EDIT_UNDO, "撤销(&U)\tCtrl+Z", state.doc.can_undo(), false);
+        add(IDM_EDIT_REDO, "重做(&R)\tCtrl+Y", state.doc.can_redo(), false);
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        add(IDM_EDIT_CUT, "剪切(&T)\tCtrl+X", !state.doc.text.is_empty(), false);
+        add(IDM_EDIT_COPY, "复制(&C)\tCtrl+C", !state.doc.text.is_empty(), false);
+        add(IDM_EDIT_PASTE, "粘贴(&P)\tCtrl+V", can_paste, false);
+        add(IDM_EDIT_DELETE, "删除(&D)", has_sel, false);
+        add(IDM_EDIT_SELECT_ALL, "全选(&A)\tCtrl+A", !state.doc.text.is_empty(), false);
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        add(IDM_EDIT_DUP_LINE, "复制当前行\tCtrl+D", true, false);
+        add(IDM_EDIT_DEL_LINE, "删除当前行\tCtrl+Shift+K", true, false);
+        add(IDM_EDIT_COMMENT, "切换引用 / 注释\tCtrl+/", true, false);
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        add(IDM_SEARCH_FIND, "查找(&F)...\tCtrl+F", true, false);
+        add(IDM_SEARCH_REPLACE, "替换(&H)...\tCtrl+H", true, false);
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        add(IDM_VIEW_WRAP, "自动换行(&W)", true, state.cfg.word_wrap);
+        add(IDM_VIEW_LINENUM, "显示行号(&L)", true, state.cfg.show_line_numbers);
+        add(IDM_VIEW_OUTLINE, "Markdown 大纲栏(&O)", true, state.cfg.outline_visible);
+
+        let mut pt = POINT { x: mx, y: my };
+        ClientToScreen(state.hwnd, &mut pt);
+        TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, state.hwnd, null());
+        DestroyMenu(menu);
+    }
+}
+
+fn show_outline_context_menu(state: &AppState, mx: i32, my: i32) {
+    unsafe {
+        let menu = CreatePopupMenu();
+        let add = |id: usize, label: &str| {
+            let w = to_wide(label);
+            AppendMenuW(menu, MF_STRING, id, w.as_ptr());
+        };
+        add(IDM_VIEW_OUTLINE_REFRESH, "刷新大纲目录(&R)");
+        add(IDM_OUTLINE_EXPAND_ALL, "全部展开(&E)");
+        add(IDM_OUTLINE_COLLAPSE_ALL, "全部折叠(&C)");
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        add(IDM_VIEW_OUTLINE, "关闭大纲栏(&X)");
+
+        let mut pt = POINT { x: mx, y: my };
+        ClientToScreen(state.hwnd, &mut pt);
+        TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, state.hwnd, null());
+        DestroyMenu(menu);
+    }
+}
+
+// ============================================================================
+// 菜单同步、主题化悬浮查找面板、转到行弹窗与指令分发
 // ============================================================================
 
 fn sync_menu_checks(state: &AppState, hmenu: HMENU) {
@@ -1531,7 +892,8 @@ fn sync_menu_checks(state: &AppState, hmenu: HMENU) {
     chk(IDM_VIEW_LINENUM, state.cfg.show_line_numbers);
     chk(IDM_VIEW_WHITESPACE, state.cfg.show_whitespace);
     chk(IDM_VIEW_OUTLINE, state.cfg.outline_visible);
-    chk(IDM_VIEW_THEME, state.cfg.dark_theme);
+    chk(IDM_VIEW_THEME_DARK, state.cfg.dark_theme);
+    chk(IDM_VIEW_THEME_LIGHT, !state.cfg.dark_theme);
     chk(IDM_VIEW_TOPMOST, state.cfg.always_on_top);
     chk(IDM_EOL_CRLF, state.doc.line_ending == LineEnding::Crlf);
     chk(IDM_EOL_LF, state.doc.line_ending == LineEnding::Lf);
@@ -1589,77 +951,102 @@ unsafe extern "system" fn edit_box_subclass(hwnd: HWND, msg: u32, wp: usize, lp:
 unsafe extern "system" fn find_panel_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
     let main_hwnd = GetParent(hwnd);
     let state_ptr = GetWindowLongPtrW(main_hwnd, GWLP_USERDATA) as *mut AppState;
-    if msg == WM_COMMAND && !state_ptr.is_null() {
+    if !state_ptr.is_null() {
         let st = &mut *state_ptr;
-        let id = loword(wp) as i32;
-        let code = hiword(wp) as u32;
-        match id {
-            IDC_FIND_EDIT if code == EN_CHANGE as u32 => {
-                st.search.query = get_win_text(st.find_edit);
-                st.refresh_search_ui();
-                return 0;
+        let theme = get_theme(st.cfg.dark_theme);
+        match msg {
+            WM_ERASEBKGND => {
+                let hdc = wp as HDC;
+                let mut rc: RECT = std::mem::zeroed();
+                GetClientRect(hwnd, &mut rc);
+                FillRect(hdc, &rc, st.find_bg_brush);
+                return 1;
             }
-            IDC_REPLACE_EDIT if code == EN_CHANGE as u32 => {
-                st.search.replace_with = get_win_text(st.replace_edit);
-                return 0;
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+                let hdc = wp as HDC;
+                SetTextColor(hdc, theme.outline_fg);
+                SetBkColor(hdc, theme.outline_hdr_bg);
+                return st.find_bg_brush as isize;
             }
-            IDC_CHK_CASE | IDC_CHK_WORD | IDC_CHK_REGEX => {
-                st.search.case_sensitive =
-                    SendMessageW(st.chk_case, BM_GETCHECK as u32, 0, 0) == BST_CHECKED as isize;
-                st.search.whole_word =
-                    SendMessageW(st.chk_word, BM_GETCHECK as u32, 0, 0) == BST_CHECKED as isize;
-                st.search.use_regex =
-                    SendMessageW(st.chk_regex, BM_GETCHECK as u32, 0, 0) == BST_CHECKED as isize;
-                st.refresh_search_ui();
-                return 0;
+            WM_CTLCOLOREDIT => {
+                let hdc = wp as HDC;
+                SetTextColor(hdc, theme.text_fg);
+                SetBkColor(hdc, theme.bg);
+                return st.find_edit_brush as isize;
             }
-            IDC_BTN_NEXT | IDC_BTN_PREV => {
-                if let Some((ms, me)) = st.search.step(id == IDC_BTN_NEXT) {
-                    st.doc.cursors = vec![Cursor { anchor: ms, head: me }];
-                    st.ensure_caret_visible();
-                    st.refresh_search_ui();
-                }
-                return 0;
-            }
-            IDC_BTN_REPLACE => {
-                if let Some(idx) = st.search.current_idx {
-                    if let Some(&(ms, me)) = st.search.matches.get(idx) {
-                        let rep = st.search.replace_with.clone();
-                        let rlen = rep.len();
-                        st.doc.apply_edits(vec![(ms, me, rep)], Some(vec![Cursor::collapsed(ms + rlen)]));
-                        st.update_gutter_width();
-                        st.sync_wraps_after_edit();
-                        st.update_title();
+            WM_COMMAND => {
+                let id = loword(wp) as i32;
+                let code = hiword(wp) as u32;
+                match id {
+                    IDC_FIND_EDIT if code == EN_CHANGE as u32 => {
+                        st.search.query = get_win_text(st.find_edit);
                         st.refresh_search_ui();
-                        if let Some((ns, ne)) = st.search.step(true) {
-                            st.doc.cursors = vec![Cursor { anchor: ns, head: ne }];
-                        }
-                        st.ensure_caret_visible();
+                        return 0;
                     }
+                    IDC_REPLACE_EDIT if code == EN_CHANGE as u32 => {
+                        st.search.replace_with = get_win_text(st.replace_edit);
+                        return 0;
+                    }
+                    IDC_CHK_CASE | IDC_CHK_WORD | IDC_CHK_REGEX => {
+                        st.search.case_sensitive =
+                            SendMessageW(st.chk_case, BM_GETCHECK as u32, 0, 0) == BST_CHECKED as isize;
+                        st.search.whole_word =
+                            SendMessageW(st.chk_word, BM_GETCHECK as u32, 0, 0) == BST_CHECKED as isize;
+                        st.search.use_regex =
+                            SendMessageW(st.chk_regex, BM_GETCHECK as u32, 0, 0) == BST_CHECKED as isize;
+                        st.refresh_search_ui();
+                        return 0;
+                    }
+                    IDC_BTN_NEXT | IDC_BTN_PREV => {
+                        if let Some((ms, me)) = st.search.step(id == IDC_BTN_NEXT) {
+                            st.doc.cursors = vec![Cursor { anchor: ms, head: me }];
+                            st.ensure_caret_visible();
+                            st.refresh_search_ui();
+                        }
+                        return 0;
+                    }
+                    IDC_BTN_REPLACE => {
+                        if let Some(idx) = st.search.current_idx {
+                            if let Some(&(ms, me)) = st.search.matches.get(idx) {
+                                let rep = st.search.replace_with.clone();
+                                let rlen = rep.len();
+                                st.doc.apply_edits(vec![(ms, me, rep)], Some(vec![Cursor::collapsed(ms + rlen)]));
+                                st.update_gutter_width();
+                                st.sync_wraps_after_edit();
+                                st.update_title();
+                                st.refresh_search_ui();
+                                if let Some((ns, ne)) = st.search.step(true) {
+                                    st.doc.cursors = vec![Cursor { anchor: ns, head: ne }];
+                                }
+                                st.ensure_caret_visible();
+                            }
+                        }
+                        return 0;
+                    }
+                    IDC_BTN_REPLACE_ALL => {
+                        if !st.search.matches.is_empty() {
+                            let rep = st.search.replace_with.clone();
+                            let edits: Vec<(usize, usize, String)> = st
+                                .search
+                                .matches
+                                .iter()
+                                .map(|&(s, e)| (s, e, rep.clone()))
+                                .collect();
+                            st.doc.apply_edits(edits, None);
+                            st.update_gutter_width();
+                            st.sync_wraps_after_edit();
+                            st.ensure_caret_visible();
+                            st.update_title();
+                            st.refresh_search_ui();
+                        }
+                        return 0;
+                    }
+                    IDC_BTN_CLOSE => {
+                        st.hide_find_panel();
+                        return 0;
+                    }
+                    _ => {}
                 }
-                return 0;
-            }
-            IDC_BTN_REPLACE_ALL => {
-                if !st.search.matches.is_empty() {
-                    let rep = st.search.replace_with.clone();
-                    let edits: Vec<(usize, usize, String)> = st
-                        .search
-                        .matches
-                        .iter()
-                        .map(|&(s, e)| (s, e, rep.clone()))
-                        .collect();
-                    st.doc.apply_edits(edits, None);
-                    st.update_gutter_width();
-                    st.sync_wraps_after_edit();
-                    st.ensure_caret_visible();
-                    st.update_title();
-                    st.refresh_search_ui();
-                }
-                return 0;
-            }
-            IDC_BTN_CLOSE => {
-                st.hide_find_panel();
-                return 0;
             }
             _ => {}
         }
@@ -1679,7 +1066,7 @@ pub fn create_find_panel(state: &mut AppState, hinst: HINSTANCE) {
             hInstance: hinst,
             hIcon: null_mut(),
             hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-            hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
+            hbrBackground: null_mut(),
             lpszMenuName: null(),
             lpszClassName: cls.as_ptr(),
             hIconSm: null_mut(),
@@ -1886,6 +1273,19 @@ fn show_goto_dialog(state: &mut AppState) {
     }
 }
 
+fn apply_theme_choice(state: &mut AppState, dark: bool) {
+    state.cfg.dark_theme = dark;
+    apply_titlebar_theme(state.hwnd, dark);
+    state.rebuild_theme_brushes();
+    save_config(&state.cfg);
+    if !state.find_panel.is_null() {
+        unsafe {
+            InvalidateRect(state.find_panel, null(), 1);
+        }
+    }
+    state.invalidate();
+}
+
 fn handle_command(state: &mut AppState, id: usize) {
     match id {
         IDM_FILE_NEW => {
@@ -1984,6 +1384,14 @@ fn handle_command(state: &mut AppState, id: usize) {
                 state.invalidate();
             }
         }
+        IDM_EDIT_DELETE => {
+            state.doc.delete_forward();
+            state.update_gutter_width();
+            state.sync_wraps_after_edit();
+            state.ensure_caret_visible();
+            state.update_title();
+            state.invalidate();
+        }
         IDM_EDIT_SELECT_ALL => {
             state.doc.cursors = vec![Cursor { anchor: 0, head: state.doc.text.len() }];
             state.invalidate();
@@ -2040,7 +1448,9 @@ fn handle_command(state: &mut AppState, id: usize) {
                     state.refresh_search_ui();
                 }
                 if let Some((ms, me)) = state.search.step(id == IDM_SEARCH_NEXT) {
-                    st_select_and_scroll(state, ms, me);
+                    state.doc.cursors = vec![Cursor { anchor: ms, head: me }];
+                    state.ensure_caret_visible();
+                    state.invalidate();
                 }
             } else {
                 state.show_find_panel(false);
@@ -2065,6 +1475,7 @@ fn handle_command(state: &mut AppState, id: usize) {
         }
         IDM_VIEW_WHITESPACE => {
             state.cfg.show_whitespace = !state.cfg.show_whitespace;
+            state.rebuild_all_wraps();
             save_config(&state.cfg);
             state.invalidate();
         }
@@ -2094,12 +1505,17 @@ fn handle_command(state: &mut AppState, id: usize) {
             state.outline.refresh_from_doc(&state.doc);
             state.invalidate();
         }
-        IDM_VIEW_FONT => dialog_choose_font(state),
-        IDM_VIEW_THEME => {
-            state.cfg.dark_theme = !state.cfg.dark_theme;
-            save_config(&state.cfg);
+        IDM_OUTLINE_EXPAND_ALL => {
+            state.outline.set_all_collapsed(false);
             state.invalidate();
         }
+        IDM_OUTLINE_COLLAPSE_ALL => {
+            state.outline.set_all_collapsed(true);
+            state.invalidate();
+        }
+        IDM_VIEW_FONT => dialog_choose_font(state),
+        IDM_VIEW_THEME_DARK => apply_theme_choice(state, true),
+        IDM_VIEW_THEME_LIGHT => apply_theme_choice(state, false),
         IDM_VIEW_TOPMOST => {
             state.cfg.always_on_top = !state.cfg.always_on_top;
             let insert_after = if state.cfg.always_on_top { HWND_TOPMOST } else { HWND_NOTOPMOST };
@@ -2144,12 +1560,6 @@ fn handle_command(state: &mut AppState, id: usize) {
         }
         _ => {}
     }
-}
-
-fn st_select_and_scroll(state: &mut AppState, ms: usize, me: usize) {
-    state.doc.cursors = vec![Cursor { anchor: ms, head: me }];
-    state.ensure_caret_visible();
-    state.invalidate();
 }
 
 fn handle_outline_click(state: &mut AppState, x: i32, y: i32) {
@@ -2292,8 +1702,7 @@ fn handle_keydown(state: &mut AppState, vk: u16) -> bool {
             if state.wrap_active() {
                 let vrow = state.byte_to_visual_row(head);
                 let x = state.measure_byte_x(head);
-                let target_vrow = vrow.saturating_sub(1);
-                let (pos, _, _) = state.hit_test_vrow_x(target_vrow, x);
+                let (pos, _, _) = state.hit_test_vrow_x(vrow.saturating_sub(1), x);
                 move_cursor(state, pos);
             } else {
                 let nl = line.saturating_sub(1);
@@ -2385,12 +1794,7 @@ fn handle_keydown(state: &mut AppState, vk: u16) -> bool {
             true
         }
         VK_DELETE => {
-            state.doc.delete_forward();
-            state.update_gutter_width();
-            state.sync_wraps_after_edit();
-            state.ensure_caret_visible();
-            state.update_title();
-            state.invalidate();
+            handle_command(state, IDM_EDIT_DELETE);
             true
         }
         _ => false,
@@ -2398,7 +1802,7 @@ fn handle_keydown(state: &mut AppState, vk: u16) -> bool {
 }
 
 // ============================================================================
-// 5. Win32 主窗口过程
+// Win32 主窗口过程
 // ============================================================================
 
 pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
@@ -2410,14 +1814,18 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
 
     match msg {
         WM_SIZE => {
-            st.client_w = loword(lp as usize) as i32;
-            st.client_h = hiword(lp as usize) as i32;
-            st.rebuild_all_wraps();
-            st.update_scrollbars();
-            if st.search.visible {
-                st.layout_find_panel();
+            let nw = loword(lp as usize) as i32;
+            let nh = hiword(lp as usize) as i32;
+            if nw > 60 && nh > 60 {
+                st.client_w = nw;
+                st.client_h = nh;
+                st.rebuild_all_wraps();
+                st.update_scrollbars();
+                if st.search.visible {
+                    st.layout_find_panel();
+                }
+                st.invalidate();
             }
-            st.invalidate();
             0
         }
         WM_ERASEBKGND => 1,
@@ -2583,6 +1991,42 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
             }
             0
         }
+        WM_RBUTTONUP => {
+            let mx = get_x_lparam(lp);
+            let my = get_y_lparam(lp);
+            if my >= st.client_h - STATUS_BAR_HEIGHT {
+                return 0;
+            }
+            SetFocus(hwnd);
+            if st.cfg.outline_visible && mx >= st.editor_right() {
+                show_outline_context_menu(st, mx, my);
+            } else {
+                let (pos, _, _) = st.hit_test(mx, my);
+                let in_sel = st.doc.cursors.iter().any(|c| {
+                    let (cs, ce) = c.range();
+                    cs < ce && pos >= cs && pos <= ce
+                });
+                if !in_sel {
+                    st.doc.cursors = vec![Cursor::collapsed(pos)];
+                    st.invalidate();
+                }
+                show_editor_context_menu(st, mx, my);
+            }
+            0
+        }
+        WM_CONTEXTMENU => {
+            // 支持键盘 Shift+F10 / Menu 键唤起右键菜单
+            if lp == -1 {
+                let head = st.doc.primary().head;
+                let vrow = st.byte_to_visual_row(head);
+                let y = ((vrow as isize - st.scroll_y as isize) as i32 * st.line_h + st.line_h)
+                    .clamp(0, st.client_h - STATUS_BAR_HEIGHT);
+                let x = (st.gutter_w + 8 + st.measure_byte_x(head) - st.scroll_x).clamp(0, st.editor_right());
+                show_editor_context_menu(st, x, y);
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         WM_MOUSEWHEEL => {
             let delta = ((wp >> 16) as i16) as i32;
             let mut pt = POINT { x: get_x_lparam(lp), y: get_y_lparam(lp) };
@@ -2676,6 +2120,11 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
             for f in [st.hfont_regular, st.hfont_bold, st.hfont_italic, st.hfont_strike, st.hfont_ui, st.hfont_ui_bold] {
                 if !f.is_null() {
                     DeleteObject(f as _);
+                }
+            }
+            for b in [st.find_bg_brush, st.find_edit_brush] {
+                if !b.is_null() {
+                    DeleteObject(b as _);
                 }
             }
             DestroyWindow(hwnd);
