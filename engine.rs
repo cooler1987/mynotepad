@@ -13,9 +13,10 @@ use std::sync::Mutex;
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, CW_USEDEFAULT, MB_ICONERROR, MB_OK};
 
-pub const LARGE_FILE_BYTES: usize = 20 * 1024 * 1024; // >20MB 触发大文件自动降级策略
+pub const LARGE_FILE_BYTES: usize = 20 * 1024 * 1024; // >20MB 触发大文件高亮降级策略
 pub const MAX_MATCH_HIGHLIGHTS: usize = 50_000;
 const CURRENT_CONFIG_VERSION: u32 = 2;
+const INLINE_LOOKAHEAD: usize = 512;
 
 pub fn to_wide(s: &str) -> Vec<u16> {
     OsStr::new(s).encode_wide().chain(std::iter::once(0)).collect()
@@ -153,7 +154,6 @@ pub fn load_config() -> AppConfig {
                 log_msg("WARN", &format!("config.json parse error, using default: {}", e));
                 AppConfig::default()
             });
-            // 自动将旧版 config.json 升级为新版默认设置（默认自动换行、默认关闭行号/大纲）
             if cfg.config_version < CURRENT_CONFIG_VERSION {
                 cfg.config_version = CURRENT_CONFIG_VERSION;
                 cfg.word_wrap = true;
@@ -183,7 +183,7 @@ pub fn save_config(cfg: &AppConfig) {
 }
 
 // ============================================================================
-// 3. 字符编码自动识别与读写（无手动转码，打开时自动识别）
+// 3. 字符编码自动识别与读写（打开时自动识别，无手动转码）
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -274,7 +274,7 @@ pub fn load_file_auto_encoding(path: &Path) -> Result<(String, DocEncoding, Line
             (DocEncoding::Utf8, 0, UTF_8)
         } else {
             let mut detector = chardetng::EncodingDetector::new();
-            let sample = bytes.len().min(256 * 1024);
+            let sample = bytes.len().min(64 * 1024);
             detector.feed(&bytes[..sample], bytes.len() <= sample);
             let guessed = detector.guess(None, true);
             let de = if guessed == BIG5 {
@@ -1042,7 +1042,7 @@ impl SearchState {
 }
 
 // ============================================================================
-// 6. Markdown / GFM 与多语言可见行语法高亮引擎（含跨行代码块状态）
+// 6. Markdown / GFM 与多语言可见行语法高亮引擎（O(N) 有界前瞻）
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1363,6 +1363,7 @@ fn scan_inline_md(
 
     while i < to {
         let b = bytes[i];
+        let look_end = clamp_str_boundary(line, (i + INLINE_LOOKAHEAD).min(to));
 
         if b == b'\\' && i + 1 < to {
             i += 2;
@@ -1376,10 +1377,10 @@ fn scan_inline_md(
             }
             let mut j = i + ticks;
             let mut found = None;
-            while j < to {
+            while j < look_end {
                 if bytes[j] == b'`' {
                     let mut c = 0usize;
-                    while j + c < to && bytes[j + c] == b'`' {
+                    while j + c < look_end && bytes[j + c] == b'`' {
                         c += 1;
                     }
                     if c == ticks {
@@ -1412,24 +1413,26 @@ fn scan_inline_md(
 
         if (b == b'!' && i + 1 < to && bytes[i + 1] == b'[') || b == b'[' {
             let lb = if b == b'!' { i + 1 } else { i };
-            if let Some(rb_rel) = line[lb + 1..to].find(']') {
-                let rb = lb + 1 + rb_rel;
-                if rb + 1 < to && bytes[rb + 1] == b'(' {
-                    if let Some(rp_rel) = line[rb + 2..to].find(')') {
-                        let rp = rb + 2 + rp_rel + 1;
-                        flush_plain(plain_start, i, out);
-                        out.push((i, rb + 1, TokenKind::Accent));
-                        out.push((rb + 1, rp, TokenKind::StringLit));
-                        i = rp;
-                        plain_start = i;
-                        continue;
+            if lb + 1 < look_end {
+                if let Some(rb_rel) = line[lb + 1..look_end].find(']') {
+                    let rb = lb + 1 + rb_rel;
+                    if rb + 1 < look_end && bytes[rb + 1] == b'(' {
+                        if let Some(rp_rel) = line[rb + 2..look_end].find(')') {
+                            let rp = rb + 2 + rp_rel + 1;
+                            flush_plain(plain_start, i, out);
+                            out.push((i, rb + 1, TokenKind::Accent));
+                            out.push((rb + 1, rp, TokenKind::StringLit));
+                            i = rp;
+                            plain_start = i;
+                            continue;
+                        }
                     }
                 }
             }
         }
 
-        if b == b'<' {
-            if let Some(gt_rel) = line[i + 1..to].find('>') {
+        if b == b'<' && i + 1 < look_end {
+            if let Some(gt_rel) = line[i + 1..look_end].find('>') {
                 let inner = &line[i + 1..i + 1 + gt_rel];
                 if inner.starts_with("http://") || inner.starts_with("https://") || inner.contains('@') {
                     let end = i + 1 + gt_rel + 1;
@@ -1442,8 +1445,8 @@ fn scan_inline_md(
             }
         }
 
-        if b == b'~' && i + 1 < to && bytes[i + 1] == b'~' {
-            if let Some(end_rel) = line[i + 2..to].find("~~") {
+        if b == b'~' && i + 1 < to && bytes[i + 1] == b'~' && i + 2 < look_end {
+            if let Some(end_rel) = line[i + 2..look_end].find("~~") {
                 if end_rel > 0 {
                     let end = i + 2 + end_rel + 2;
                     flush_plain(plain_start, i, out);
@@ -1455,11 +1458,11 @@ fn scan_inline_md(
             }
         }
 
-        if (b == b'*' || b == b'_') && i + 1 < to && bytes[i + 1] == b {
+        if (b == b'*' || b == b'_') && i + 1 < to && bytes[i + 1] == b && i + 2 < look_end {
             let pat = if b == b'*' { "**" } else { "__" };
             let word_ok = b == b'*' || i == from || !is_ident_char(bytes[i - 1]);
             if word_ok {
-                if let Some(end_rel) = line[i + 2..to].find(pat) {
+                if let Some(end_rel) = line[i + 2..look_end].find(pat) {
                     if end_rel > 0 {
                         let end = i + 2 + end_rel + 2;
                         flush_plain(plain_start, i, out);
@@ -1474,11 +1477,11 @@ fn scan_inline_md(
 
         if b == b'*' || b == b'_' {
             let word_ok = b == b'*' || i == from || !is_ident_char(bytes[i - 1]);
-            if word_ok && i + 1 < to && bytes[i + 1] != b' ' && bytes[i + 1] != b {
+            if word_ok && i + 1 < look_end && bytes[i + 1] != b' ' && bytes[i + 1] != b {
                 let mut j = i + 1;
                 let mut found = None;
-                while j < to {
-                    if bytes[j] == b'\\' && j + 1 < to {
+                while j < look_end {
+                    if bytes[j] == b'\\' && j + 1 < look_end {
                         j += 2;
                         continue;
                     }
