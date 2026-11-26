@@ -3,11 +3,8 @@ use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
-use windows_sys::Win32::System::DataExchange::*;
-use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows_sys::Win32::System::Memory::*;
-use windows_sys::Win32::UI::Controls::Dialogs::*;
-use windows_sys::Win32::UI::Controls::{BST_CHECKED, EM_SETSEL, SetScrollInfo};
+use windows_sys::Win32::System::DataExchange::IsClipboardFormatAvailable;
+use windows_sys::Win32::UI::Controls::{EM_SETSEL, SetScrollInfo};
 use windows_sys::Win32::UI::Input::Ime::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::*;
@@ -19,10 +16,13 @@ use crate::render::{
     get_theme, paint_editor, VisualSeg, OUTLINE_HEADER_H, OUTLINE_ROW_H, STATUS_BAR_HEIGHT,
 };
 use crate::{
-    IDM_EDIT_COMMENT, IDM_EDIT_COPY, IDM_EDIT_CUT, IDM_EDIT_DELETE, IDM_EDIT_DEL_LINE,
-    IDM_EDIT_DUP_LINE, IDM_EDIT_LOWER, IDM_EDIT_MOVE_DOWN, IDM_EDIT_MOVE_UP, IDM_EDIT_PASTE,
-    IDM_EDIT_REDO, IDM_EDIT_SELECT_ALL, IDM_EDIT_UNDO, IDM_EDIT_UPPER, IDM_EOL_CRLF, IDM_EOL_LF,
-    IDM_FILE_EXIT, IDM_FILE_NEW, IDM_FILE_OPEN, IDM_FILE_RELOAD, IDM_FILE_SAVE, IDM_FILE_SAVEAS,
+    clipboard_copy, clipboard_paste, dialog_choose_font, dialog_open_file, dialog_save_file,
+    show_goto_dialog, CF_UNICODETEXT_ID, FIND_PANEL_H, FIND_PANEL_W, IDC_BTN_REPLACE,
+    IDC_BTN_REPLACE_ALL, IDM_EDIT_COMMENT, IDM_EDIT_COPY, IDM_EDIT_CUT, IDM_EDIT_DELETE,
+    IDM_EDIT_DEL_LINE, IDM_EDIT_DUP_LINE, IDM_EDIT_LOWER, IDM_EDIT_MOVE_DOWN, IDM_EDIT_MOVE_UP,
+    IDM_EDIT_PASTE, IDM_EDIT_REDO, IDM_EDIT_SELECT_ALL, IDM_EDIT_UNDO, IDM_EDIT_UPPER,
+    IDM_EOL_CRLF, IDM_EOL_LF, IDM_FILE_EXIT, IDM_FILE_NEW, IDM_FILE_OPEN, IDM_FILE_RECENT_BASE,
+    IDM_FILE_RECENT_CLEAR, IDM_FILE_RELOAD, IDM_FILE_SAVE, IDM_FILE_SAVEAS,
     IDM_OUTLINE_COLLAPSE_ALL, IDM_OUTLINE_EXPAND_ALL, IDM_SEARCH_FIND, IDM_SEARCH_GOTO,
     IDM_SEARCH_NEXT, IDM_SEARCH_PREV, IDM_SEARCH_REPLACE, IDM_VIEW_FONT, IDM_VIEW_LINENUM,
     IDM_VIEW_OUTLINE, IDM_VIEW_OUTLINE_REFRESH, IDM_VIEW_THEME_DARK, IDM_VIEW_THEME_LIGHT,
@@ -30,34 +30,9 @@ use crate::{
     IDM_VIEW_ZOOM_RESET,
 };
 
-const FIND_PANEL_W: i32 = 430;
-const FIND_PANEL_H: i32 = 108;
-const CF_UNICODETEXT_ID: u32 = 13;
-const SS_CENTER: u32 = 1;
-
-const IDC_FIND_EDIT: i32 = 6001;
-const IDC_REPLACE_EDIT: i32 = 6002;
-const IDC_CHK_CASE: i32 = 6003;
-const IDC_CHK_WORD: i32 = 6004;
-const IDC_CHK_REGEX: i32 = 6005;
-const IDC_BTN_PREV: i32 = 6006;
-const IDC_BTN_NEXT: i32 = 6007;
-const IDC_BTN_REPLACE: i32 = 6008;
-const IDC_BTN_REPLACE_ALL: i32 = 6009;
-const IDC_BTN_CLOSE: i32 = 6010;
-const IDC_LBL_COUNT: i32 = 6011;
-
-const IDC_GOTO_EDIT: i32 = 6101;
-const IDC_GOTO_OK: i32 = 6102;
-const IDC_GOTO_CANCEL: i32 = 6103;
-
 #[inline]
 fn loword(v: usize) -> u16 {
     (v & 0xFFFF) as u16
-}
-#[inline]
-fn hiword(v: usize) -> u16 {
-    ((v >> 16) & 0xFFFF) as u16
 }
 #[inline]
 fn get_x_lparam(lp: isize) -> i32 {
@@ -74,6 +49,7 @@ fn key_down(vk: u16) -> bool {
 
 pub struct AppState {
     pub hwnd: HWND,
+    pub recent_menu: HMENU,
     pub hfont_regular: HFONT,
     pub hfont_bold: HFONT,
     pub hfont_italic: HFONT,
@@ -95,8 +71,9 @@ pub struct AppState {
 
     pub scroll_y: usize,
     pub scroll_x: i32,
-    pub last_wrap_px: i32,
-    pub line_wraps: Vec<Vec<(usize, usize)>>,
+    pub wrap_max_px_cached: i32,
+    pub line_wraps: Vec<Option<Vec<(usize, usize)>>>,
+    pub line_row_counts: Vec<usize>,
     pub visual_prefix: Vec<usize>,
 
     pub dragging: bool,
@@ -179,7 +156,7 @@ impl AppState {
             ReleaseDC(self.hwnd, hdc);
         }
         self.update_gutter_width();
-        self.rebuild_all_wraps();
+        self.reset_wraps_lazy();
     }
 
     pub fn update_gutter_width(&mut self) {
@@ -191,7 +168,7 @@ impl AppState {
         self.gutter_w = (digits as i32 * self.avg_char_w) + 22;
     }
 
-    pub fn outline_panel_width(&self) -> i32 {
+    fn outline_panel_width(&self) -> i32 {
         if self.cfg.outline_visible && self.client_w > 460 {
             self.cfg.outline_width.clamp(180, (self.client_w / 2).max(180))
         } else {
@@ -203,7 +180,7 @@ impl AppState {
         (self.client_w - self.outline_panel_width()).max(140)
     }
 
-    pub fn editor_height(&self) -> i32 {
+    fn editor_height(&self) -> i32 {
         (self.client_h - STATUS_BAR_HEIGHT).max(self.line_h)
     }
 
@@ -212,60 +189,136 @@ impl AppState {
     }
 
     pub fn wrap_active(&self) -> bool {
-        self.cfg.word_wrap && !self.doc.large_mode
+        self.cfg.word_wrap
     }
 
     fn wrap_max_px(&self) -> i32 {
         (self.editor_right() - self.gutter_w - 30).max(self.avg_char_w * 6)
     }
 
-    fn rebuild_visual_prefix(&mut self) {
-        self.visual_prefix.clear();
-        self.visual_prefix.reserve(self.line_wraps.len() + 1);
-        let mut acc = 0usize;
-        self.visual_prefix.push(0);
-        for segs in &self.line_wraps {
-            acc += segs.len().max(1);
-            self.visual_prefix.push(acc);
+    fn rebuild_visual_prefix_from(&mut self, start_line: usize) {
+        if start_line == 0 || self.visual_prefix.len() != self.line_row_counts.len() + 1 {
+            self.visual_prefix.clear();
+            self.visual_prefix.reserve(self.line_row_counts.len() + 1);
+            let mut acc = 0usize;
+            self.visual_prefix.push(0);
+            for &cnt in &self.line_row_counts {
+                acc += cnt.max(1);
+                self.visual_prefix.push(acc);
+            }
+            return;
+        }
+        let mut acc = self.visual_prefix[start_line];
+        for i in start_line..self.line_row_counts.len() {
+            acc += self.line_row_counts[i].max(1);
+            self.visual_prefix[i + 1] = acc;
         }
     }
 
-    pub fn rebuild_all_wraps(&mut self) {
+    pub fn reset_wraps_lazy(&mut self) {
         self.doc.wrap_patches.clear();
-        self.line_wraps.clear();
         if !self.wrap_active() {
+            self.line_wraps.clear();
+            self.line_row_counts.clear();
             self.visual_prefix.clear();
-            self.last_wrap_px = 0;
+            self.wrap_max_px_cached = 0;
             return;
         }
         if self.client_w <= 60 {
             return;
         }
         let max_px = self.wrap_max_px();
-        self.last_wrap_px = max_px;
+        self.wrap_max_px_cached = max_px;
         let count = self.doc.line_count();
-        self.line_wraps.reserve(count);
-        let is_md = self.doc.lang == Lang::Markdown;
+        let est_cols = ((max_px / self.avg_char_w.max(6)).max(8)) as usize;
+
+        self.line_wraps.clear();
+        self.line_wraps.resize(count, None);
+        self.line_row_counts.clear();
+        self.line_row_counts.reserve(count);
+        for l in 0..count {
+            let (s, e) = self.doc.line_bounds(l);
+            let est = ((e - s) / est_cols.max(1)).max(1);
+            self.line_row_counts.push(est);
+        }
+        self.rebuild_visual_prefix_from(0);
+    }
+
+    fn ensure_line_wrapped_with_dc(&mut self, hdc: HDC, line: usize) -> bool {
+        if !self.wrap_active() || line >= self.doc.line_count() {
+            return false;
+        }
+        if self.line_wraps.len() != self.doc.line_count() {
+            self.reset_wraps_lazy();
+        }
+        if self.line_wraps.get(line).is_some_and(|w| w.is_some()) {
+            return false;
+        }
+        let segs = compute_line_wraps_with_dc(
+            hdc,
+            self.doc.line_str(line),
+            self.wrap_max_px_cached,
+            self.avg_char_w,
+            self.cfg.show_whitespace,
+            self.hfont_regular,
+            self.hfont_bold,
+            self.doc.lang == Lang::Markdown,
+        );
+        let new_rows = segs.len().max(1);
+        let old_rows = self.line_row_counts[line];
+        self.line_wraps[line] = Some(segs);
+        if new_rows != old_rows {
+            self.line_row_counts[line] = new_rows;
+            self.rebuild_visual_prefix_from(line);
+            return true;
+        }
+        false
+    }
+
+    fn ensure_single_line_wrapped(&mut self, line: usize) {
+        if !self.wrap_active() || line >= self.doc.line_count() {
+            return;
+        }
+        if self.line_wraps.get(line).is_some_and(|w| w.is_some()) && self.wrap_max_px_cached == self.wrap_max_px() {
+            return;
+        }
+        if self.wrap_max_px_cached != self.wrap_max_px() {
+            self.reset_wraps_lazy();
+        }
         unsafe {
             let hdc = GetDC(self.hwnd);
-            let old = SelectObject(hdc, self.hfont_regular as _);
-            for l in 0..count {
-                let s = self.doc.line_str(l);
-                self.line_wraps.push(compute_line_wraps_with_dc(
-                    hdc,
-                    s,
-                    max_px,
-                    self.avg_char_w,
-                    self.cfg.show_whitespace,
-                    self.hfont_regular,
-                    self.hfont_bold,
-                    is_md,
-                ));
-            }
-            SelectObject(hdc, old);
+            self.ensure_line_wrapped_with_dc(hdc, line);
             ReleaseDC(self.hwnd, hdc);
         }
-        self.rebuild_visual_prefix();
+    }
+
+    pub fn ensure_viewport_wraps(&mut self) {
+        if !self.wrap_active() || self.client_w <= 60 {
+            return;
+        }
+        let cur_max = self.wrap_max_px();
+        if self.line_wraps.len() != self.doc.line_count() || self.wrap_max_px_cached != cur_max {
+            self.reset_wraps_lazy();
+        }
+        let vis_rows = self.visible_row_count() + 4;
+        let mut changed = false;
+        unsafe {
+            let hdc = GetDC(self.hwnd);
+            for r in 0..vis_rows {
+                let vrow = self.scroll_y + r;
+                if vrow >= self.total_visual_lines() {
+                    break;
+                }
+                let line = self.visual_prefix.partition_point(|&p| p <= vrow).saturating_sub(1);
+                if self.ensure_line_wrapped_with_dc(hdc, line) {
+                    changed = true;
+                }
+            }
+            ReleaseDC(self.hwnd, hdc);
+        }
+        if changed {
+            self.update_scrollbars();
+        }
     }
 
     pub fn sync_wraps_after_edit(&mut self) {
@@ -274,50 +327,62 @@ impl AppState {
             return;
         }
         let max_px = self.wrap_max_px();
-        if self.line_wraps.is_empty() || max_px != self.last_wrap_px {
-            self.rebuild_all_wraps();
+        if self.line_wraps.is_empty() || max_px != self.wrap_max_px_cached {
+            self.reset_wraps_lazy();
             return;
         }
         if patches.is_empty() && self.line_wraps.len() == self.doc.line_count() {
             return;
         }
-        let is_md = self.doc.lang == Lang::Markdown;
+        let est_cols = ((max_px / self.avg_char_w.max(6)).max(8)) as usize;
+        let mut min_dirty = usize::MAX;
         unsafe {
             let hdc = GetDC(self.hwnd);
-            let old = SelectObject(hdc, self.hfont_regular as _);
             for (start_line, old_count, new_count) in patches {
                 if start_line > self.line_wraps.len() || start_line + old_count > self.line_wraps.len() {
-                    SelectObject(hdc, old);
                     ReleaseDC(self.hwnd, hdc);
-                    self.rebuild_all_wraps();
+                    self.reset_wraps_lazy();
                     return;
                 }
-                let mut rep_wraps = Vec::with_capacity(new_count);
-                for l in start_line..(start_line + new_count) {
-                    if l >= self.doc.line_count() {
-                        break;
+                min_dirty = min_dirty.min(start_line);
+                if new_count <= 24 {
+                    let mut rep_wraps = Vec::with_capacity(new_count);
+                    let mut rep_counts = Vec::with_capacity(new_count);
+                    for l in start_line..(start_line + new_count) {
+                        if l >= self.doc.line_count() {
+                            break;
+                        }
+                        let segs = compute_line_wraps_with_dc(
+                            hdc,
+                            self.doc.line_str(l),
+                            max_px,
+                            self.avg_char_w,
+                            self.cfg.show_whitespace,
+                            self.hfont_regular,
+                            self.hfont_bold,
+                            self.doc.lang == Lang::Markdown,
+                        );
+                        rep_counts.push(segs.len().max(1));
+                        rep_wraps.push(Some(segs));
                     }
-                    let s = self.doc.line_str(l);
-                    rep_wraps.push(compute_line_wraps_with_dc(
-                        hdc,
-                        s,
-                        max_px,
-                        self.avg_char_w,
-                        self.cfg.show_whitespace,
-                        self.hfont_regular,
-                        self.hfont_bold,
-                        is_md,
-                    ));
+                    self.line_wraps.splice(start_line..(start_line + old_count), rep_wraps);
+                    self.line_row_counts.splice(start_line..(start_line + old_count), rep_counts);
+                } else {
+                    let mut rep_counts = Vec::with_capacity(new_count);
+                    for l in start_line..(start_line + new_count) {
+                        let (s, e) = self.doc.line_bounds(l);
+                        rep_counts.push(((e - s) / est_cols.max(1)).max(1));
+                    }
+                    self.line_wraps.splice(start_line..(start_line + old_count), vec![None; new_count]);
+                    self.line_row_counts.splice(start_line..(start_line + old_count), rep_counts);
                 }
-                self.line_wraps.splice(start_line..(start_line + old_count), rep_wraps);
             }
-            SelectObject(hdc, old);
             ReleaseDC(self.hwnd, hdc);
         }
         if self.line_wraps.len() != self.doc.line_count() {
-            self.rebuild_all_wraps();
-        } else {
-            self.rebuild_visual_prefix();
+            self.reset_wraps_lazy();
+        } else if min_dirty != usize::MAX {
+            self.rebuild_visual_prefix_from(min_dirty);
         }
     }
 
@@ -337,8 +402,16 @@ impl AppState {
             }
             let line = self.visual_prefix.partition_point(|&p| p <= vrow).saturating_sub(1);
             let seg_idx = vrow - self.visual_prefix[line];
-            let (bs, be) = self.line_wraps.get(line)?.get(seg_idx).copied()?;
-            Some(VisualSeg { line, b_start: bs, b_end: be })
+            if let Some(Some(segs)) = self.line_wraps.get(line) {
+                let (bs, be) = segs.get(seg_idx).copied().unwrap_or_else(|| {
+                    let (s, e) = self.doc.line_bounds(line);
+                    (0, e - s)
+                });
+                Some(VisualSeg { line, b_start: bs, b_end: be })
+            } else {
+                let (s, e) = self.doc.line_bounds(line);
+                Some(VisualSeg { line, b_start: 0, b_end: e - s })
+            }
         } else if vrow < self.doc.line_count() {
             let (s, e) = self.doc.line_bounds(vrow);
             Some(VisualSeg { line: vrow, b_start: 0, b_end: e - s })
@@ -347,15 +420,16 @@ impl AppState {
         }
     }
 
-    pub fn byte_to_visual_row(&self, byte_pos: usize) -> usize {
+    pub fn byte_to_visual_row(&mut self, byte_pos: usize) -> usize {
         let line = self.doc.line_of_byte(byte_pos);
         if !self.wrap_active() {
             return line;
         }
+        self.ensure_single_line_wrapped(line);
         let line_start = self.doc.line_starts[line];
         let rel = byte_pos.saturating_sub(line_start);
         let base = *self.visual_prefix.get(line).unwrap_or(&0);
-        if let Some(segs) = self.line_wraps.get(line) {
+        if let Some(Some(segs)) = self.line_wraps.get(line) {
             for (idx, &(_, be)) in segs.iter().enumerate() {
                 if rel <= be {
                     return base + idx;
@@ -366,7 +440,7 @@ impl AppState {
         base
     }
 
-    fn update_title(&self) {
+    pub fn update_title(&self) {
         let mark = if self.doc.dirty { "* " } else { "" };
         let title = if let Some(p) = &self.doc.path {
             let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("未命名");
@@ -412,7 +486,7 @@ impl AppState {
         }
     }
 
-    fn ensure_caret_visible(&mut self) {
+    pub fn ensure_caret_visible(&mut self) {
         let head = self.doc.primary().head;
         let vrow = self.byte_to_visual_row(head);
         let page = self.visible_row_count();
@@ -434,7 +508,7 @@ impl AppState {
         self.update_scrollbars();
     }
 
-    fn measure_byte_x(&self, byte_pos: usize) -> i32 {
+    fn measure_byte_x(&mut self, byte_pos: usize) -> i32 {
         let line = self.doc.line_of_byte(byte_pos);
         let seg_start = if self.wrap_active() {
             let vrow = self.byte_to_visual_row(byte_pos);
@@ -461,7 +535,12 @@ impl AppState {
         }
     }
 
-    fn hit_test_vrow_x(&self, vrow: usize, target_x: i32) -> (usize, usize, usize) {
+    fn hit_test_vrow_x(&mut self, vrow: usize, target_x: i32) -> (usize, usize, usize) {
+        if self.wrap_active() && !self.visual_prefix.is_empty() {
+            let tv = vrow.min(self.total_visual_lines().saturating_sub(1));
+            let line = self.visual_prefix.partition_point(|&p| p <= tv).saturating_sub(1);
+            self.ensure_single_line_wrapped(line);
+        }
         let clamped_vrow = vrow.min(self.total_visual_lines().saturating_sub(1));
         let Some(seg) = self.get_visual_seg(clamped_vrow) else {
             return (0, 0, 0);
@@ -513,20 +592,20 @@ impl AppState {
         }
     }
 
-    fn hit_test(&self, mouse_x: i32, mouse_y: i32) -> (usize, usize, usize) {
+    fn hit_test(&mut self, mouse_x: i32, mouse_y: i32) -> (usize, usize, usize) {
         let rel_row = (mouse_y.max(0) / self.line_h.max(1)) as usize;
         let vrow = self.scroll_y + rel_row;
         let target_x = mouse_x - self.gutter_w - 8 + self.scroll_x;
         self.hit_test_vrow_x(vrow, target_x)
     }
 
-    fn invalidate(&self) {
+    pub fn invalidate(&self) {
         unsafe {
             InvalidateRect(self.hwnd, null(), 0);
         }
     }
 
-    fn update_ime_pos(&self) {
+    fn update_ime_pos(&mut self) {
         let head = self.doc.primary().head;
         let vrow = self.byte_to_visual_row(head);
         let y = (vrow as isize - self.scroll_y as isize) as i32 * self.line_h;
@@ -545,7 +624,7 @@ impl AppState {
         }
     }
 
-    fn refresh_search_ui(&mut self) {
+    pub fn refresh_search_ui(&mut self) {
         let caret = self.doc.primary().head;
         self.search.recompute(&self.doc.text, caret);
         let text = if let Some(err) = &self.search.last_error {
@@ -586,7 +665,7 @@ impl AppState {
         self.refresh_search_ui();
     }
 
-    fn hide_find_panel(&mut self) {
+    pub fn hide_find_panel(&mut self) {
         self.search.visible = false;
         unsafe {
             ShowWindow(self.find_panel, SW_HIDE);
@@ -617,7 +696,7 @@ impl AppState {
                 self.scroll_y = 0;
                 self.scroll_x = 0;
                 self.update_gutter_width();
-                self.rebuild_all_wraps();
+                self.reset_wraps_lazy();
                 self.update_scrollbars();
                 self.update_title();
 
@@ -663,7 +742,7 @@ impl AppState {
         let target = if !save_as { self.doc.path.clone() } else { None };
         let path = match target {
             Some(p) => p,
-            None => match dialog_save_file(self.hwnd) {
+            None => match dialog_save_file(self.hwnd, self.doc.path.as_deref()) {
                 Some(p) => p,
                 None => return false,
             },
@@ -681,6 +760,12 @@ impl AppState {
                 if self.cfg.outline_visible {
                     self.outline.refresh_from_doc(&self.doc);
                 }
+                let pstr = path.to_string_lossy().to_string();
+                self.cfg.recent_files.retain(|r| r != &pstr);
+                self.cfg.recent_files.insert(0, pstr);
+                self.cfg.recent_files.truncate(10);
+                save_config(&self.cfg);
+
                 self.update_title();
                 self.invalidate();
                 true
@@ -695,126 +780,46 @@ impl AppState {
 }
 
 // ============================================================================
-// 剪贴板与系统文件/字体对话框
+// 菜单同步 & 右键上下文菜单
 // ============================================================================
 
-fn clipboard_copy(hwnd: HWND, text: &str) {
-    if text.is_empty() {
+fn sync_recent_menu(state: &AppState) {
+    if state.recent_menu.is_null() {
         return;
     }
-    let wide = to_wide(text);
     unsafe {
-        if OpenClipboard(hwnd) == 0 {
-            return;
-        }
-        EmptyClipboard();
-        let bytes = wide.len() * 2;
-        let hmem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if !hmem.is_null() {
-            let ptr = GlobalLock(hmem) as *mut u16;
-            if !ptr.is_null() {
-                std::ptr::copy_nonoverlapping(wide.as_ptr(), ptr, wide.len());
-                GlobalUnlock(hmem);
-                SetClipboardData(CF_UNICODETEXT_ID, hmem);
+        while DeleteMenu(state.recent_menu, 0, MF_BYPOSITION) != 0 {}
+        if state.cfg.recent_files.is_empty() {
+            let empty_w = to_wide("（无历史记录）");
+            AppendMenuW(state.recent_menu, MF_STRING | MF_GRAYED, 0, empty_w.as_ptr());
+        } else {
+            for (idx, p) in state.cfg.recent_files.iter().take(10).enumerate() {
+                let label = format!("&{}  {}", idx + 1, p);
+                let wl = to_wide(&label);
+                AppendMenuW(state.recent_menu, MF_STRING, IDM_FILE_RECENT_BASE + idx, wl.as_ptr());
             }
-        }
-        CloseClipboard();
-    }
-}
-
-fn clipboard_paste(hwnd: HWND) -> Option<String> {
-    unsafe {
-        if OpenClipboard(hwnd) == 0 {
-            return None;
-        }
-        let hdata = GetClipboardData(CF_UNICODETEXT_ID);
-        let mut res = None;
-        if !hdata.is_null() {
-            let ptr = GlobalLock(hdata) as *const u16;
-            if !ptr.is_null() {
-                let mut len = 0usize;
-                while *ptr.add(len) != 0 {
-                    len += 1;
-                }
-                let slice = std::slice::from_raw_parts(ptr, len);
-                let (norm, _) = normalize_newlines_fast(&String::from_utf16_lossy(slice));
-                res = Some(norm);
-                GlobalUnlock(hdata);
-            }
-        }
-        CloseClipboard();
-        res
-    }
-}
-
-fn dialog_open_file(hwnd: HWND) -> Option<PathBuf> {
-    let mut buf = vec![0u16; 4096];
-    let filter: Vec<u16> = "Markdown 与文本 (*.md;*.markdown;*.txt;*.log)\0*.md;*.markdown;*.txt;*.log\0所有文件 (*.*)\0*.*\0\0"
-        .encode_utf16()
-        .collect();
-    unsafe {
-        let mut ofn: OPENFILENAMEW = std::mem::zeroed();
-        ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
-        ofn.hwndOwner = hwnd;
-        ofn.lpstrFilter = filter.as_ptr();
-        ofn.lpstrFile = buf.as_mut_ptr();
-        ofn.nMaxFile = buf.len() as u32;
-        ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
-        if GetOpenFileNameW(&mut ofn) != 0 {
-            return Some(PathBuf::from(from_wide_slice(&buf)));
-        }
-    }
-    None
-}
-
-fn dialog_save_file(hwnd: HWND) -> Option<PathBuf> {
-    let mut buf = vec![0u16; 4096];
-    let filter: Vec<u16> = "Markdown 文档 (*.md)\0*.md\0文本文档 (*.txt)\0*.txt\0所有文件 (*.*)\0*.*\0\0"
-        .encode_utf16()
-        .collect();
-    unsafe {
-        let mut ofn: OPENFILENAMEW = std::mem::zeroed();
-        ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
-        ofn.hwndOwner = hwnd;
-        ofn.lpstrFilter = filter.as_ptr();
-        ofn.lpstrFile = buf.as_mut_ptr();
-        ofn.nMaxFile = buf.len() as u32;
-        ofn.Flags = OFN_EXPLORER | OFN_OVERWRITEPROMPT | OFN_HIDEREADONLY;
-        if GetSaveFileNameW(&mut ofn) != 0 {
-            return Some(PathBuf::from(from_wide_slice(&buf)));
-        }
-    }
-    None
-}
-
-fn dialog_choose_font(state: &mut AppState) {
-    unsafe {
-        let mut lf: LOGFONTW = std::mem::zeroed();
-        lf.lfHeight = -state.cfg.font_size;
-        lf.lfWeight = FW_NORMAL as i32;
-        let wname = to_wide(&state.cfg.font_name);
-        let n = wname.len().min(32);
-        lf.lfFaceName[..n].copy_from_slice(&wname[..n]);
-
-        let mut cf: CHOOSEFONTW = std::mem::zeroed();
-        cf.lStructSize = std::mem::size_of::<CHOOSEFONTW>() as u32;
-        cf.hwndOwner = state.hwnd;
-        cf.lpLogFont = &mut lf;
-        cf.Flags = CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT;
-        if ChooseFontW(&mut cf) != 0 {
-            state.cfg.font_name = from_wide_slice(&lf.lfFaceName);
-            state.cfg.font_size = (cf.iPointSize / 10).max(8);
-            state.cfg.zoom_pct = 100;
-            state.recreate_fonts();
-            save_config(&state.cfg);
-            state.invalidate();
+            AppendMenuW(state.recent_menu, MF_SEPARATOR, 0, null());
+            let clr_w = to_wide("清空历史记录(&C)");
+            AppendMenuW(state.recent_menu, MF_STRING, IDM_FILE_RECENT_CLEAR, clr_w.as_ptr());
         }
     }
 }
 
-// ============================================================================
-// 右键上下文菜单（编辑区 + 大纲栏）
-// ============================================================================
+fn sync_menu_checks(state: &AppState, hmenu: HMENU) {
+    let chk = |id: usize, on: bool| unsafe {
+        CheckMenuItem(hmenu, id as u32, MF_BYCOMMAND | if on { MF_CHECKED } else { MF_UNCHECKED });
+    };
+    chk(IDM_VIEW_WRAP, state.cfg.word_wrap);
+    chk(IDM_VIEW_LINENUM, state.cfg.show_line_numbers);
+    chk(IDM_VIEW_WHITESPACE, state.cfg.show_whitespace);
+    chk(IDM_VIEW_OUTLINE, state.cfg.outline_visible);
+    chk(IDM_VIEW_THEME_DARK, state.cfg.dark_theme);
+    chk(IDM_VIEW_THEME_LIGHT, !state.cfg.dark_theme);
+    chk(IDM_VIEW_TOPMOST, state.cfg.always_on_top);
+    chk(IDM_EOL_CRLF, state.doc.line_ending == LineEnding::Crlf);
+    chk(IDM_EOL_LF, state.doc.line_ending == LineEnding::Lf);
+    sync_recent_menu(state);
+}
 
 fn show_editor_context_menu(state: &AppState, mx: i32, my: i32) {
     unsafe {
@@ -881,397 +886,8 @@ fn show_outline_context_menu(state: &AppState, mx: i32, my: i32) {
 }
 
 // ============================================================================
-// 菜单同步、主题化悬浮查找面板、转到行弹窗与指令分发
+// 命令分发、大纲交互与快捷键处理
 // ============================================================================
-
-fn sync_menu_checks(state: &AppState, hmenu: HMENU) {
-    let chk = |id: usize, on: bool| unsafe {
-        CheckMenuItem(hmenu, id as u32, MF_BYCOMMAND | if on { MF_CHECKED } else { MF_UNCHECKED });
-    };
-    chk(IDM_VIEW_WRAP, state.cfg.word_wrap);
-    chk(IDM_VIEW_LINENUM, state.cfg.show_line_numbers);
-    chk(IDM_VIEW_WHITESPACE, state.cfg.show_whitespace);
-    chk(IDM_VIEW_OUTLINE, state.cfg.outline_visible);
-    chk(IDM_VIEW_THEME_DARK, state.cfg.dark_theme);
-    chk(IDM_VIEW_THEME_LIGHT, !state.cfg.dark_theme);
-    chk(IDM_VIEW_TOPMOST, state.cfg.always_on_top);
-    chk(IDM_EOL_CRLF, state.doc.line_ending == LineEnding::Crlf);
-    chk(IDM_EOL_LF, state.doc.line_ending == LineEnding::Lf);
-}
-
-fn get_win_text(hwnd: HWND) -> String {
-    unsafe {
-        let len = GetWindowTextLengthW(hwnd);
-        if len <= 0 {
-            return String::new();
-        }
-        let mut buf = vec![0u16; (len + 1) as usize];
-        GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
-        from_wide_slice(&buf)
-    }
-}
-
-unsafe extern "system" fn edit_box_subclass(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
-    let panel = GetParent(hwnd);
-    let main_hwnd = GetParent(panel);
-    let state_ptr = GetWindowLongPtrW(main_hwnd, GWLP_USERDATA) as *mut AppState;
-    let orig = if !state_ptr.is_null() {
-        let st = &*state_ptr;
-        if hwnd == st.find_edit { st.orig_find_edit_proc } else { st.orig_rep_edit_proc }
-    } else {
-        0
-    };
-
-    if msg == WM_KEYDOWN && !state_ptr.is_null() {
-        let st = &mut *state_ptr;
-        if wp == VK_ESCAPE as usize {
-            st.hide_find_panel();
-            return 0;
-        }
-        if wp == VK_RETURN as usize {
-            let forward = !key_down(VK_SHIFT);
-            if let Some((ms, me)) = st.search.step(forward) {
-                st.doc.cursors = vec![Cursor { anchor: ms, head: me }];
-                st.ensure_caret_visible();
-                st.refresh_search_ui();
-            }
-            return 0;
-        }
-        if wp == VK_TAB as usize && st.search.show_replace {
-            let target = if hwnd == st.find_edit { st.replace_edit } else { st.find_edit };
-            SetFocus(target);
-            SendMessageW(target, EM_SETSEL as u32, 0, -1);
-            return 0;
-        }
-    }
-    let prev: WNDPROC = std::mem::transmute(orig);
-    CallWindowProcW(prev, hwnd, msg, wp, lp)
-}
-
-unsafe extern "system" fn find_panel_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
-    let main_hwnd = GetParent(hwnd);
-    let state_ptr = GetWindowLongPtrW(main_hwnd, GWLP_USERDATA) as *mut AppState;
-    if !state_ptr.is_null() {
-        let st = &mut *state_ptr;
-        let theme = get_theme(st.cfg.dark_theme);
-        match msg {
-            WM_ERASEBKGND => {
-                let hdc = wp as HDC;
-                let mut rc: RECT = std::mem::zeroed();
-                GetClientRect(hwnd, &mut rc);
-                FillRect(hdc, &rc, st.find_bg_brush);
-                return 1;
-            }
-            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-                let hdc = wp as HDC;
-                SetTextColor(hdc, theme.outline_fg);
-                SetBkColor(hdc, theme.outline_hdr_bg);
-                return st.find_bg_brush as isize;
-            }
-            WM_CTLCOLOREDIT => {
-                let hdc = wp as HDC;
-                SetTextColor(hdc, theme.text_fg);
-                SetBkColor(hdc, theme.bg);
-                return st.find_edit_brush as isize;
-            }
-            WM_COMMAND => {
-                let id = loword(wp) as i32;
-                let code = hiword(wp) as u32;
-                match id {
-                    IDC_FIND_EDIT if code == EN_CHANGE as u32 => {
-                        st.search.query = get_win_text(st.find_edit);
-                        st.refresh_search_ui();
-                        return 0;
-                    }
-                    IDC_REPLACE_EDIT if code == EN_CHANGE as u32 => {
-                        st.search.replace_with = get_win_text(st.replace_edit);
-                        return 0;
-                    }
-                    IDC_CHK_CASE | IDC_CHK_WORD | IDC_CHK_REGEX => {
-                        st.search.case_sensitive =
-                            SendMessageW(st.chk_case, BM_GETCHECK as u32, 0, 0) == BST_CHECKED as isize;
-                        st.search.whole_word =
-                            SendMessageW(st.chk_word, BM_GETCHECK as u32, 0, 0) == BST_CHECKED as isize;
-                        st.search.use_regex =
-                            SendMessageW(st.chk_regex, BM_GETCHECK as u32, 0, 0) == BST_CHECKED as isize;
-                        st.refresh_search_ui();
-                        return 0;
-                    }
-                    IDC_BTN_NEXT | IDC_BTN_PREV => {
-                        if let Some((ms, me)) = st.search.step(id == IDC_BTN_NEXT) {
-                            st.doc.cursors = vec![Cursor { anchor: ms, head: me }];
-                            st.ensure_caret_visible();
-                            st.refresh_search_ui();
-                        }
-                        return 0;
-                    }
-                    IDC_BTN_REPLACE => {
-                        if let Some(idx) = st.search.current_idx {
-                            if let Some(&(ms, me)) = st.search.matches.get(idx) {
-                                let rep = st.search.replace_with.clone();
-                                let rlen = rep.len();
-                                st.doc.apply_edits(vec![(ms, me, rep)], Some(vec![Cursor::collapsed(ms + rlen)]));
-                                st.update_gutter_width();
-                                st.sync_wraps_after_edit();
-                                st.update_title();
-                                st.refresh_search_ui();
-                                if let Some((ns, ne)) = st.search.step(true) {
-                                    st.doc.cursors = vec![Cursor { anchor: ns, head: ne }];
-                                }
-                                st.ensure_caret_visible();
-                            }
-                        }
-                        return 0;
-                    }
-                    IDC_BTN_REPLACE_ALL => {
-                        if !st.search.matches.is_empty() {
-                            let rep = st.search.replace_with.clone();
-                            let edits: Vec<(usize, usize, String)> = st
-                                .search
-                                .matches
-                                .iter()
-                                .map(|&(s, e)| (s, e, rep.clone()))
-                                .collect();
-                            st.doc.apply_edits(edits, None);
-                            st.update_gutter_width();
-                            st.sync_wraps_after_edit();
-                            st.ensure_caret_visible();
-                            st.update_title();
-                            st.refresh_search_ui();
-                        }
-                        return 0;
-                    }
-                    IDC_BTN_CLOSE => {
-                        st.hide_find_panel();
-                        return 0;
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-    DefWindowProcW(hwnd, msg, wp, lp)
-}
-
-pub fn create_find_panel(state: &mut AppState, hinst: HINSTANCE) {
-    unsafe {
-        let cls = to_wide("NotepadLiteFindPanel");
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: 0,
-            lpfnWndProc: Some(find_panel_proc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: hinst,
-            hIcon: null_mut(),
-            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-            hbrBackground: null_mut(),
-            lpszMenuName: null(),
-            lpszClassName: cls.as_ptr(),
-            hIconSm: null_mut(),
-        };
-        RegisterClassExW(&wc);
-
-        let panel = CreateWindowExW(
-            WS_EX_CONTROLPARENT,
-            cls.as_ptr(),
-            null(),
-            WS_CHILD | WS_BORDER | WS_CLIPSIBLINGS,
-            0,
-            0,
-            FIND_PANEL_W,
-            FIND_PANEL_H,
-            state.hwnd,
-            null_mut(),
-            hinst,
-            null(),
-        );
-        state.find_panel = panel;
-
-        let mk = |cls_name: &str, text: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: i32| -> HWND {
-            let wc = to_wide(cls_name);
-            let wt = to_wide(text);
-            let ch = CreateWindowExW(
-                0,
-                wc.as_ptr(),
-                wt.as_ptr(),
-                WS_CHILD | WS_VISIBLE | style,
-                x,
-                y,
-                w,
-                h,
-                panel,
-                id as isize as HMENU,
-                hinst,
-                null(),
-            );
-            SendMessageW(ch, WM_SETFONT as u32, state.hfont_ui as usize, 1);
-            ch
-        };
-
-        state.find_edit = mk("EDIT", "", WS_BORDER | ES_AUTOHSCROLL as u32, 8, 8, 200, 24, IDC_FIND_EDIT);
-        state.lbl_count = mk("STATIC", "0 / 0", SS_CENTER, 214, 12, 74, 20, IDC_LBL_COUNT);
-        mk("BUTTON", "↑", BS_PUSHBUTTON as u32, 294, 8, 30, 24, IDC_BTN_PREV);
-        mk("BUTTON", "↓", BS_PUSHBUTTON as u32, 328, 8, 30, 24, IDC_BTN_NEXT);
-        mk("BUTTON", "×", BS_PUSHBUTTON as u32, 392, 8, 28, 24, IDC_BTN_CLOSE);
-
-        state.chk_case = mk("BUTTON", "区分大小写", BS_AUTOCHECKBOX as u32, 8, 38, 92, 22, IDC_CHK_CASE);
-        state.chk_word = mk("BUTTON", "全词匹配", BS_AUTOCHECKBOX as u32, 106, 38, 80, 22, IDC_CHK_WORD);
-        state.chk_regex = mk("BUTTON", "正则(Regex)", BS_AUTOCHECKBOX as u32, 192, 38, 100, 22, IDC_CHK_REGEX);
-
-        state.replace_edit = mk("EDIT", "", WS_BORDER | ES_AUTOHSCROLL as u32, 8, 70, 200, 24, IDC_REPLACE_EDIT);
-        mk("BUTTON", "替换", BS_PUSHBUTTON as u32, 214, 70, 68, 24, IDC_BTN_REPLACE);
-        mk("BUTTON", "全部替换", BS_PUSHBUTTON as u32, 288, 70, 86, 24, IDC_BTN_REPLACE_ALL);
-
-        state.orig_find_edit_proc = SetWindowLongPtrW(state.find_edit, GWLP_WNDPROC, edit_box_subclass as isize);
-        state.orig_rep_edit_proc = SetWindowLongPtrW(state.replace_edit, GWLP_WNDPROC, edit_box_subclass as isize);
-    }
-}
-
-unsafe extern "system" fn goto_edit_subclass(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
-    let orig = GetWindowLongPtrW(hwnd, GWLP_USERDATA);
-    if msg == WM_KEYDOWN {
-        let dlg = GetParent(hwnd);
-        if wp == VK_RETURN as usize {
-            SendMessageW(dlg, WM_COMMAND, IDC_GOTO_OK as usize, 0);
-            return 0;
-        }
-        if wp == VK_ESCAPE as usize {
-            SendMessageW(dlg, WM_COMMAND, IDC_GOTO_CANCEL as usize, 0);
-            return 0;
-        }
-    }
-    let prev: WNDPROC = std::mem::transmute(orig);
-    CallWindowProcW(prev, hwnd, msg, wp, lp)
-}
-
-unsafe extern "system" fn goto_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
-    let main_hwnd = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as HWND;
-    let state_ptr = if !main_hwnd.is_null() {
-        GetWindowLongPtrW(main_hwnd, GWLP_USERDATA) as *mut AppState
-    } else {
-        null_mut()
-    };
-
-    match msg {
-        WM_COMMAND if !state_ptr.is_null() => {
-            let st = &mut *state_ptr;
-            let id = loword(wp) as i32;
-            if id == IDC_GOTO_OK {
-                let s = get_win_text(st.goto_edit);
-                if let Ok(line_num) = s.trim().parse::<usize>() {
-                    let target = line_num.saturating_sub(1).min(st.doc.line_count().saturating_sub(1));
-                    let pos = st.doc.line_col_to_byte(target, 0);
-                    st.doc.cursors = vec![Cursor::collapsed(pos)];
-                    st.ensure_caret_visible();
-                    st.invalidate();
-                }
-                DestroyWindow(hwnd);
-                st.goto_hwnd = null_mut();
-                SetFocus(st.hwnd);
-                return 0;
-            } else if id == IDC_GOTO_CANCEL {
-                DestroyWindow(hwnd);
-                st.goto_hwnd = null_mut();
-                SetFocus(st.hwnd);
-                return 0;
-            }
-        }
-        WM_CLOSE if !state_ptr.is_null() => {
-            let st = &mut *state_ptr;
-            DestroyWindow(hwnd);
-            st.goto_hwnd = null_mut();
-            SetFocus(st.hwnd);
-            return 0;
-        }
-        _ => {}
-    }
-    DefWindowProcW(hwnd, msg, wp, lp)
-}
-
-fn show_goto_dialog(state: &mut AppState) {
-    unsafe {
-        if !state.goto_hwnd.is_null() {
-            SetFocus(state.goto_edit);
-            return;
-        }
-        let hinst = GetModuleHandleW(null());
-        let cls = to_wide("NotepadLiteGotoDlg");
-        let wc = WNDCLASSEXW {
-            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
-            style: 0,
-            lpfnWndProc: Some(goto_proc),
-            cbClsExtra: 0,
-            cbWndExtra: 0,
-            hInstance: hinst,
-            hIcon: null_mut(),
-            hCursor: LoadCursorW(null_mut(), IDC_ARROW),
-            hbrBackground: GetSysColorBrush(COLOR_BTNFACE),
-            lpszMenuName: null(),
-            lpszClassName: cls.as_ptr(),
-            hIconSm: null_mut(),
-        };
-        RegisterClassExW(&wc);
-
-        let mut rc: RECT = std::mem::zeroed();
-        GetWindowRect(state.hwnd, &mut rc);
-        let title = to_wide("转到指定行");
-        let dlg = CreateWindowExW(
-            WS_EX_TOOLWINDOW,
-            cls.as_ptr(),
-            title.as_ptr(),
-            WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
-            rc.left + 120,
-            rc.top + 120,
-            260,
-            125,
-            state.hwnd,
-            null_mut(),
-            hinst,
-            null(),
-        );
-        SetWindowLongPtrW(dlg, GWLP_USERDATA, state.hwnd as isize);
-        state.goto_hwnd = dlg;
-
-        let lbl = to_wide(&format!("行号 (1 - {}):", state.doc.line_count()));
-        let st_cls = to_wide("STATIC");
-        let h1 = CreateWindowExW(0, st_cls.as_ptr(), lbl.as_ptr(), WS_CHILD | WS_VISIBLE, 12, 10, 220, 18, dlg, null_mut(), hinst, null());
-        SendMessageW(h1, WM_SETFONT as u32, state.hfont_ui as usize, 1);
-
-        let ed_cls = to_wide("EDIT");
-        let (cur_l, _) = state.doc.byte_to_line_col(state.doc.primary().head);
-        let init_v = to_wide(&(cur_l + 1).to_string());
-        let ed = CreateWindowExW(
-            0,
-            ed_cls.as_ptr(),
-            init_v.as_ptr(),
-            WS_CHILD | WS_VISIBLE | WS_BORDER | ES_NUMBER as u32,
-            12,
-            30,
-            220,
-            24,
-            dlg,
-            IDC_GOTO_EDIT as isize as HMENU,
-            hinst,
-            null(),
-        );
-        SendMessageW(ed, WM_SETFONT as u32, state.hfont_ui as usize, 1);
-        let orig_ed = SetWindowLongPtrW(ed, GWLP_WNDPROC, goto_edit_subclass as isize);
-        SetWindowLongPtrW(ed, GWLP_USERDATA, orig_ed);
-        state.goto_edit = ed;
-
-        let bt_cls = to_wide("BUTTON");
-        let ok_t = to_wide("确定");
-        let ca_t = to_wide("取消");
-        let b1 = CreateWindowExW(0, bt_cls.as_ptr(), ok_t.as_ptr(), WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON as u32, 82, 62, 70, 24, dlg, IDC_GOTO_OK as isize as HMENU, hinst, null());
-        let b2 = CreateWindowExW(0, bt_cls.as_ptr(), ca_t.as_ptr(), WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON as u32, 162, 62, 70, 24, dlg, IDC_GOTO_CANCEL as isize as HMENU, hinst, null());
-        SendMessageW(b1, WM_SETFONT as u32, state.hfont_ui as usize, 1);
-        SendMessageW(b2, WM_SETFONT as u32, state.hfont_ui as usize, 1);
-        SetFocus(ed);
-        SendMessageW(ed, EM_SETSEL as u32, 0, -1);
-    }
-}
 
 fn apply_theme_choice(state: &mut AppState, dark: bool) {
     state.cfg.dark_theme = dark;
@@ -1286,7 +902,7 @@ fn apply_theme_choice(state: &mut AppState, dark: bool) {
     state.invalidate();
 }
 
-fn handle_command(state: &mut AppState, id: usize) {
+pub fn handle_command(state: &mut AppState, id: usize) {
     match id {
         IDM_FILE_NEW => {
             if state.confirm_discard() {
@@ -1294,7 +910,7 @@ fn handle_command(state: &mut AppState, id: usize) {
                 state.scroll_y = 0;
                 state.scroll_x = 0;
                 state.update_gutter_width();
-                state.rebuild_all_wraps();
+                state.reset_wraps_lazy();
                 state.update_scrollbars();
                 if state.cfg.outline_visible {
                     state.outline.refresh_from_doc(&state.doc);
@@ -1327,6 +943,25 @@ fn handle_command(state: &mut AppState, id: usize) {
                 state.outline.refresh_from_doc(&state.doc);
                 state.invalidate();
             }
+        }
+        IDM_FILE_RECENT_BASE..=1109 => {
+            let idx = id - IDM_FILE_RECENT_BASE;
+            if let Some(pstr) = state.cfg.recent_files.get(idx).cloned() {
+                if state.confirm_discard() {
+                    let p = PathBuf::from(&pstr);
+                    if p.exists() {
+                        state.open_file_path(&p);
+                    } else {
+                        state.cfg.recent_files.remove(idx);
+                        save_config(&state.cfg);
+                        show_fatal_box("文件不存在", &format!("找不到文件，已从历史记录中移除:\n{}", pstr));
+                    }
+                }
+            }
+        }
+        IDM_FILE_RECENT_CLEAR => {
+            state.cfg.recent_files.clear();
+            save_config(&state.cfg);
         }
         IDM_FILE_EXIT => unsafe {
             PostMessageW(state.hwnd, WM_CLOSE, 0, 0);
@@ -1460,7 +1095,7 @@ fn handle_command(state: &mut AppState, id: usize) {
 
         IDM_VIEW_WRAP => {
             state.cfg.word_wrap = !state.cfg.word_wrap;
-            state.rebuild_all_wraps();
+            state.reset_wraps_lazy();
             state.ensure_caret_visible();
             save_config(&state.cfg);
             state.invalidate();
@@ -1468,14 +1103,14 @@ fn handle_command(state: &mut AppState, id: usize) {
         IDM_VIEW_LINENUM => {
             state.cfg.show_line_numbers = !state.cfg.show_line_numbers;
             state.update_gutter_width();
-            state.rebuild_all_wraps();
+            state.reset_wraps_lazy();
             state.update_scrollbars();
             save_config(&state.cfg);
             state.invalidate();
         }
         IDM_VIEW_WHITESPACE => {
             state.cfg.show_whitespace = !state.cfg.show_whitespace;
-            state.rebuild_all_wraps();
+            state.reset_wraps_lazy();
             save_config(&state.cfg);
             state.invalidate();
         }
@@ -1484,7 +1119,7 @@ fn handle_command(state: &mut AppState, id: usize) {
             if state.cfg.outline_visible {
                 state.outline.refresh_from_doc(&state.doc);
             }
-            state.rebuild_all_wraps();
+            state.reset_wraps_lazy();
             state.update_scrollbars();
             if state.search.visible {
                 state.layout_find_panel();
@@ -1495,7 +1130,7 @@ fn handle_command(state: &mut AppState, id: usize) {
         IDM_VIEW_OUTLINE_REFRESH => {
             if !state.cfg.outline_visible {
                 state.cfg.outline_visible = true;
-                state.rebuild_all_wraps();
+                state.reset_wraps_lazy();
                 state.update_scrollbars();
                 if state.search.visible {
                     state.layout_find_panel();
@@ -1815,11 +1450,11 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
     match msg {
         WM_SIZE => {
             let nw = loword(lp as usize) as i32;
-            let nh = hiword(lp as usize) as i32;
+            let nh = ((lp >> 16) & 0xFFFF) as i16 as i32;
             if nw > 60 && nh > 60 {
                 st.client_w = nw;
                 st.client_h = nh;
-                st.rebuild_all_wraps();
+                st.reset_wraps_lazy();
                 st.update_scrollbars();
                 if st.search.visible {
                     st.layout_find_panel();
@@ -1948,7 +1583,7 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
                 let new_w = (st.client_w - mx).clamp(180, (st.client_w / 2).max(180));
                 if new_w != st.cfg.outline_width {
                     st.cfg.outline_width = new_w;
-                    st.rebuild_all_wraps();
+                    st.reset_wraps_lazy();
                     st.update_scrollbars();
                     if st.search.visible {
                         st.layout_find_panel();
@@ -2015,7 +1650,6 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
             0
         }
         WM_CONTEXTMENU => {
-            // 支持键盘 Shift+F10 / Menu 键唤起右键菜单
             if lp == -1 {
                 let head = st.doc.primary().head;
                 let vrow = st.byte_to_visual_row(head);
