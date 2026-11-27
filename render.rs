@@ -12,6 +12,7 @@ use crate::ui::AppState;
 pub const STATUS_BAR_HEIGHT: i32 = 24;
 pub const OUTLINE_HEADER_H: i32 = 30;
 pub const OUTLINE_ROW_H: i32 = 24;
+pub const FOLD_COL_W: i32 = 16;
 
 // ============================================================================
 // 1. 深色与浅色两套完整主题配色 + 系统标题栏深色适配
@@ -23,6 +24,7 @@ pub struct Theme {
     pub gutter_bg: u32,
     pub gutter_fg: u32,
     pub cur_line_bg: u32,
+    pub search_line_bg: u32,
     pub code_block_bg: u32,
     pub inline_code_bg: u32,
     pub sel_bg: u32,
@@ -32,6 +34,9 @@ pub struct Theme {
     pub text_fg: u32,
     pub caret: u32,
     pub ws_fg: u32,
+    pub fold_box_bg: u32,
+    pub fold_box_border: u32,
+    pub fold_badge_bg: u32,
     pub status_bg: u32,
     pub status_fg: u32,
     pub status_border: u32,
@@ -44,6 +49,7 @@ pub struct Theme {
     pub kw_fg: u32,
     pub h1_fg: u32,
     pub h2_fg: u32,
+    pub h3_fg: u32,
     pub str_fg: u32,
     pub cmt_fg: u32,
     pub num_fg: u32,
@@ -67,16 +73,20 @@ pub fn get_theme(dark: bool) -> Theme {
             bg: rgb(30, 30, 30),
             gutter_bg: rgb(35, 35, 37),
             gutter_fg: rgb(125, 125, 125),
-            cur_line_bg: rgb(40, 43, 47),
+            cur_line_bg: rgb(40, 44, 52),
+            search_line_bg: rgb(56, 50, 30),
             code_block_bg: rgb(46, 42, 28),
             inline_code_bg: rgb(58, 52, 34),
             sel_bg: rgb(38, 79, 120),
-            match_bg: rgb(90, 70, 30),
-            cur_match_bg: rgb(160, 110, 30),
+            match_bg: rgb(95, 75, 28),
+            cur_match_bg: rgb(195, 130, 30),
             bracket_bg: rgb(65, 95, 65),
             text_fg: rgb(216, 216, 216),
             caret: rgb(240, 240, 240),
             ws_fg: rgb(85, 85, 85),
+            fold_box_bg: rgb(45, 47, 52),
+            fold_box_border: rgb(115, 120, 130),
+            fold_badge_bg: rgb(52, 56, 65),
             status_bg: rgb(0, 122, 204),
             status_fg: rgb(255, 255, 255),
             status_border: rgb(55, 55, 60),
@@ -88,7 +98,8 @@ pub fn get_theme(dark: bool) -> Theme {
             outline_muted: rgb(148, 154, 164),
             kw_fg: rgb(86, 156, 214),
             h1_fg: rgb(97, 175, 239),
-            h2_fg: rgb(128, 203, 196),
+            h2_fg: rgb(110, 200, 225),
+            h3_fg: rgb(178, 148, 210),
             str_fg: rgb(206, 145, 120),
             cmt_fg: rgb(128, 168, 112),
             num_fg: rgb(181, 206, 168),
@@ -106,16 +117,20 @@ pub fn get_theme(dark: bool) -> Theme {
             bg: rgb(255, 255, 255),
             gutter_bg: rgb(246, 246, 248),
             gutter_fg: rgb(130, 130, 130),
-            cur_line_bg: rgb(242, 247, 255),
+            cur_line_bg: rgb(235, 244, 254),
+            search_line_bg: rgb(255, 246, 188),
             code_block_bg: rgb(253, 249, 224),
             inline_code_bg: rgb(250, 242, 202),
             sel_bg: rgb(173, 214, 255),
-            match_bg: rgb(255, 235, 150),
-            cur_match_bg: rgb(255, 180, 70),
+            match_bg: rgb(255, 236, 140),
+            cur_match_bg: rgb(255, 172, 45),
             bracket_bg: rgb(205, 238, 205),
             text_fg: rgb(32, 35, 40),
             caret: rgb(0, 0, 0),
             ws_fg: rgb(195, 195, 195),
+            fold_box_bg: rgb(255, 255, 255),
+            fold_box_border: rgb(145, 152, 162),
+            fold_badge_bg: rgb(234, 238, 244),
             status_bg: rgb(240, 242, 245),
             status_fg: rgb(45, 48, 55),
             status_border: rgb(215, 218, 222),
@@ -126,8 +141,9 @@ pub fn get_theme(dark: bool) -> Theme {
             outline_fg: rgb(35, 38, 45),
             outline_muted: rgb(115, 120, 130),
             kw_fg: rgb(0, 92, 197),
-            h1_fg: rgb(9, 105, 218),
-            h2_fg: rgb(5, 118, 126),
+            h1_fg: rgb(0, 102, 255),
+            h2_fg: rgb(0, 122, 204),
+            h3_fg: rgb(72, 84, 168),
             str_fg: rgb(163, 21, 21),
             cmt_fg: rgb(87, 122, 92),
             num_fg: rgb(9, 134, 88),
@@ -392,6 +408,35 @@ fn find_matching_bracket(doc: &Document, pos: usize) -> Option<(usize, usize)> {
     None
 }
 
+unsafe fn draw_fold_box(mem_dc: HDC, x: i32, y: i32, line_h: i32, collapsed: bool, theme: Theme) {
+    let size = 11;
+    let bx = x;
+    let by = y + (line_h - size) / 2;
+    let rc = RECT { left: bx, top: by, right: bx + size, bottom: by + size };
+    let bg = CreateSolidBrush(theme.fold_box_bg);
+    FillRect(mem_dc, &rc, bg);
+    DeleteObject(bg as _);
+
+    let pen = CreatePen(PS_SOLID as i32, 1, theme.fold_box_border);
+    let old_pen = SelectObject(mem_dc, pen as _);
+    MoveToEx(mem_dc, bx, by, null_mut());
+    LineTo(mem_dc, bx + size - 1, by);
+    LineTo(mem_dc, bx + size - 1, by + size - 1);
+    LineTo(mem_dc, bx, by + size - 1);
+    LineTo(mem_dc, bx, by);
+
+    let mid_x = bx + size / 2;
+    let mid_y = by + size / 2;
+    MoveToEx(mem_dc, bx + 2, mid_y, null_mut());
+    LineTo(mem_dc, bx + size - 2, mid_y);
+    if collapsed {
+        MoveToEx(mem_dc, mid_x, by + 2, null_mut());
+        LineTo(mem_dc, mid_x, by + size - 2);
+    }
+    SelectObject(mem_dc, old_pen);
+    DeleteObject(pen as _);
+}
+
 pub fn paint_outline_panel(
     state: &AppState,
     mem_dc: HDC,
@@ -427,7 +472,6 @@ pub fn paint_outline_panel(
         let mut trc = RECT { left: left + 8, top: 6, right: right - 138, bottom: OUTLINE_HEADER_H - 2 };
         DrawTextW(mem_dc, title_w.as_ptr(), (title_w.len() - 1) as i32, &mut trc, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-        // 顶部 5 个按钮：[刷新] [展] [折] [浮/停] [×]
         SelectObject(mem_dc, state.hfont_ui as _);
         let btn_br = CreateSolidBrush(theme.outline_btn_bg);
         let mode_lbl = if floating { "停" } else { "浮" };
@@ -553,6 +597,13 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
         DeleteObject(gut_br as _);
 
         let cur_line = state.doc.line_of_byte(state.doc.primary().head);
+        let active_match_line = if state.search.visible {
+            state.search.current_idx
+                .and_then(|idx| state.search.matches.get(idx))
+                .map(|&(ms, _)| state.doc.line_of_byte(ms))
+        } else {
+            None
+        };
         let bracket_pair = if !state.doc.large_mode {
             find_matching_bracket(&state.doc, state.doc.primary().head)
         } else {
@@ -562,6 +613,7 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
         let clip_rgn = CreateRectRgn(state.gutter_w, 0, edit_r, edit_b);
         let vis_rows = state.visible_row_count() + 1;
         let cur_line_br = CreateSolidBrush(theme.cur_line_bg);
+        let search_line_br = CreateSolidBrush(theme.search_line_bg);
         let code_blk_br = CreateSolidBrush(theme.code_block_bg);
         let inline_code_br = CreateSolidBrush(theme.inline_code_bg);
         let quote_bar_br = CreateSolidBrush(theme.acc_fg);
@@ -569,6 +621,7 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
         let match_br = CreateSolidBrush(theme.match_bg);
         let cur_match_br = CreateSolidBrush(theme.cur_match_bg);
         let brk_br = CreateSolidBrush(theme.bracket_bg);
+        let fold_badge_br = CreateSolidBrush(theme.fold_badge_bg);
         let caret_br = CreateSolidBrush(theme.caret);
         let hr_pen = CreatePen(PS_SOLID as i32, 1, theme.ws_fg);
 
@@ -578,7 +631,8 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
         let mut cached_attr = LineAttr::default();
 
         let text_left = state.gutter_w + 8 - state.scroll_x;
-        let active_lang = if state.doc.large_mode { Lang::Plain } else { state.doc.lang };
+        // 即使是大文件，可见行依然保持语法高亮
+        let active_lang = state.doc.lang;
 
         for r in 0..vis_rows {
             let vrow = state.scroll_y + r;
@@ -608,7 +662,10 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
                 let cb_rc = RECT { left: state.gutter_w, top: y, right: edit_r, bottom: y + state.line_h };
                 FillRect(mem_dc, &cb_rc, code_blk_br);
             }
-            if seg.line == cur_line {
+            if active_match_line == Some(seg.line) {
+                let s_rc = RECT { left: state.gutter_w, top: y, right: edit_r, bottom: y + state.line_h };
+                FillRect(mem_dc, &s_rc, search_line_br);
+            } else if seg.line == cur_line {
                 let row_rc = RECT { left: state.gutter_w, top: y, right: edit_r, bottom: y + state.line_h };
                 FillRect(mem_dc, &row_rc, cur_line_br);
             }
@@ -617,12 +674,23 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
                 FillRect(mem_dc, &q_rc, quote_bar_br);
             }
 
-            if state.cfg.show_line_numbers && seg.line != last_drawn_logical {
-                SelectObject(mem_dc, state.hfont_regular as _);
-                SetTextColor(mem_dc, if seg.line == cur_line { theme.text_fg } else { theme.gutter_fg });
-                let num_s = to_wide(&(seg.line + 1).to_string());
-                let mut nrc = RECT { left: 2, top: y + 2, right: state.gutter_w - 8, bottom: y + state.line_h };
-                DrawTextW(mem_dc, num_s.as_ptr(), (num_s.len() - 1) as i32, &mut nrc, DT_RIGHT | DT_SINGLELINE);
+            if seg.line != last_drawn_logical {
+                if state.cfg.show_line_numbers {
+                    SelectObject(mem_dc, state.hfont_regular as _);
+                    SetTextColor(mem_dc, if seg.line == cur_line { theme.text_fg } else { theme.gutter_fg });
+                    let num_s = to_wide(&(seg.line + 1).to_string());
+                    let mut nrc = RECT {
+                        left: 2,
+                        top: y + 2,
+                        right: (state.gutter_w - FOLD_COL_W - 6).max(16),
+                        bottom: y + state.line_h,
+                    };
+                    DrawTextW(mem_dc, num_s.as_ptr(), (num_s.len() - 1) as i32, &mut nrc, DT_RIGHT | DT_SINGLELINE);
+                }
+                if state.doc.line_levels.get(seg.line).copied().unwrap_or(0) > 0 {
+                    let collapsed = state.doc.line_folded.get(seg.line).copied().unwrap_or(false);
+                    draw_fold_box(mem_dc, state.gutter_w - FOLD_COL_W + 2, y, state.line_h, collapsed, theme);
+                }
             }
             last_drawn_logical = seg.line;
 
@@ -665,20 +733,6 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
                 text_left + sz.cx
             };
 
-            if state.search.visible && !state.search.matches.is_empty() {
-                let lo = state.search.matches.partition_point(|m| m.1 <= seg_abs_start);
-                for idx in lo..state.search.matches.len() {
-                    let (ms, me) = state.search.matches[idx];
-                    if ms >= seg_abs_end {
-                        break;
-                    }
-                    let xs = seg_x(ms.max(seg_abs_start));
-                    let xe = seg_x(me.min(seg_abs_end));
-                    let mrc = RECT { left: xs, top: y, right: xe.max(xs + 2), bottom: y + state.line_h };
-                    FillRect(mem_dc, &mrc, if state.search.current_idx == Some(idx) { cur_match_br } else { match_br });
-                }
-            }
-
             if let Some((b1, b2)) = bracket_pair {
                 for bp in [b1, b2] {
                     if bp >= seg_abs_start && bp < seg_abs_end {
@@ -700,6 +754,21 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
                     }
                     let src = RECT { left: xs, top: y, right: xe.max(xs + 2), bottom: y + state.line_h };
                     FillRect(mem_dc, &src, sel_br);
+                }
+            }
+
+            // 搜索匹配高亮画在普通选区之上，保证当前命中目标高亮清晰可见
+            if state.search.visible && !state.search.matches.is_empty() {
+                let lo = state.search.matches.partition_point(|m| m.1 <= seg_abs_start);
+                for idx in lo..state.search.matches.len() {
+                    let (ms, me) = state.search.matches[idx];
+                    if ms >= seg_abs_end {
+                        break;
+                    }
+                    let xs = seg_x(ms.max(seg_abs_start));
+                    let xe = seg_x(me.min(seg_abs_end));
+                    let mrc = RECT { left: xs, top: y, right: xe.max(xs + 2), bottom: y + state.line_h };
+                    FillRect(mem_dc, &mrc, if state.search.current_idx == Some(idx) { cur_match_br } else { match_br });
                 }
             }
 
@@ -745,6 +814,7 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
                     TokenKind::Keyword => (theme.kw_fg, state.hfont_regular, false),
                     TokenKind::Heading1 => (theme.h1_fg, state.hfont_bold, false),
                     TokenKind::Heading2 => (theme.h2_fg, state.hfont_bold, false),
+                    TokenKind::Heading3 => (theme.h3_fg, state.hfont_bold, false),
                     TokenKind::StringLit => (theme.str_fg, state.hfont_regular, false),
                     TokenKind::Comment => (theme.cmt_fg, state.hfont_regular, false),
                     TokenKind::Number => (theme.num_fg, state.hfont_regular, false),
@@ -767,6 +837,24 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
                 draw_chunk(&draw_slice[p_safe..], theme.text_fg, state.hfont_regular, false, &mut cur_x, &mut cur_col);
             }
 
+            // 折叠标题末尾提示徽标
+            if safe_be == full_line.len() && state.doc.line_folded.get(seg.line).copied().unwrap_or(false) {
+                let hidden_cnt = state.doc.folded_descendant_count(seg.line);
+                if hidden_cnt > 0 {
+                    let badge = format!("  ... +{} 行  ", hidden_cnt);
+                    let bw = to_wide(&badge);
+                    let blen = (bw.len() - 1) as i32;
+                    SelectObject(mem_dc, state.hfont_ui as _);
+                    let mut bsz: SIZE = std::mem::zeroed();
+                    GetTextExtentPoint32W(mem_dc, bw.as_ptr(), blen, &mut bsz);
+                    let bx = cur_x + 10;
+                    let brc = RECT { left: bx, top: y + 3, right: bx + bsz.cx, bottom: y + state.line_h - 3 };
+                    FillRect(mem_dc, &brc, fold_badge_br);
+                    SetTextColor(mem_dc, theme.outline_muted);
+                    TextOutW(mem_dc, bx, y + 4, bw.as_ptr(), blen);
+                }
+            }
+
             for c in &state.doc.cursors {
                 let in_seg = if safe_be == full_line.len() {
                     c.head >= seg_abs_start && c.head <= seg_abs_end
@@ -785,6 +873,7 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
 
         DeleteObject(clip_rgn as _);
         DeleteObject(cur_line_br as _);
+        DeleteObject(search_line_br as _);
         DeleteObject(code_blk_br as _);
         DeleteObject(inline_code_br as _);
         DeleteObject(quote_bar_br as _);
@@ -792,6 +881,7 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
         DeleteObject(match_br as _);
         DeleteObject(cur_match_br as _);
         DeleteObject(brk_br as _);
+        DeleteObject(fold_badge_br as _);
         DeleteObject(caret_br as _);
         DeleteObject(hr_pen as _);
 
