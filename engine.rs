@@ -525,9 +525,12 @@ impl Document {
         let mut st = LineState::Normal;
         for l in 0..count {
             self.line_states[l] = st;
-            let line = self.line_str(l);
-            self.line_levels[l] = detect_heading_level(line, st);
-            st = advance_md_line_state(st, line);
+            let (lvl, next_st) = {
+                let line = self.line_str(l);
+                (detect_heading_level(line, st), advance_md_line_state(st, line))
+            };
+            self.line_levels[l] = lvl;
+            st = next_st;
         }
     }
 
@@ -542,9 +545,12 @@ impl Document {
         let mut st = self.line_states[start_line];
         for l in start_line..count {
             self.line_states[l] = st;
-            let line = self.line_str(l);
-            self.line_levels[l] = detect_heading_level(line, st);
-            st = advance_md_line_state(st, line);
+            let (lvl, next_st) = {
+                let line = self.line_str(l);
+                (detect_heading_level(line, st), advance_md_line_state(st, line))
+            };
+            self.line_levels[l] = lvl;
+            st = next_st;
             if l + 1 < count && l >= dirty_end_line && self.line_states[l + 1] == st {
                 break;
             }
