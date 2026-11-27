@@ -14,8 +14,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::engine::*;
 use crate::render::{
     apply_titlebar_theme, compute_line_wraps_with_dc, expand_tabs_col, expand_tabs_with_u16_map,
-    get_theme, paint_editor, paint_floating_outline, VisualSeg, OUTLINE_HEADER_H, OUTLINE_ROW_H,
-    STATUS_BAR_HEIGHT,
+    get_theme, paint_editor, paint_floating_outline, VisualSeg, FOLD_COL_W, OUTLINE_HEADER_H,
+    OUTLINE_ROW_H, STATUS_BAR_HEIGHT,
 };
 use crate::{
     clipboard_copy, clipboard_paste, dialog_choose_font, dialog_open_file, dialog_save_file,
@@ -26,10 +26,11 @@ use crate::{
     IDM_EOL_CRLF, IDM_EOL_LF, IDM_FILE_EXIT, IDM_FILE_NEW, IDM_FILE_OPEN, IDM_FILE_RECENT_BASE,
     IDM_FILE_RECENT_CLEAR, IDM_FILE_RELOAD, IDM_FILE_SAVE, IDM_FILE_SAVEAS,
     IDM_OUTLINE_COLLAPSE_ALL, IDM_OUTLINE_EXPAND_ALL, IDM_SEARCH_FIND, IDM_SEARCH_GOTO,
-    IDM_SEARCH_NEXT, IDM_SEARCH_PREV, IDM_SEARCH_REPLACE, IDM_VIEW_FONT, IDM_VIEW_LINENUM,
-    IDM_VIEW_OUTLINE, IDM_VIEW_OUTLINE_FLOAT, IDM_VIEW_OUTLINE_REFRESH, IDM_VIEW_THEME_DARK,
-    IDM_VIEW_THEME_LIGHT, IDM_VIEW_TOPMOST, IDM_VIEW_WHITESPACE, IDM_VIEW_WRAP, IDM_VIEW_ZOOM_IN,
-    IDM_VIEW_ZOOM_OUT, IDM_VIEW_ZOOM_RESET,
+    IDM_SEARCH_NEXT, IDM_SEARCH_PREV, IDM_SEARCH_REPLACE, IDM_VIEW_FOLD_ALL, IDM_VIEW_FOLD_TOGGLE,
+    IDM_VIEW_FONT, IDM_VIEW_LINENUM, IDM_VIEW_OUTLINE, IDM_VIEW_OUTLINE_FLOAT,
+    IDM_VIEW_OUTLINE_REFRESH, IDM_VIEW_THEME_DARK, IDM_VIEW_THEME_LIGHT, IDM_VIEW_TOPMOST,
+    IDM_VIEW_UNFOLD_ALL, IDM_VIEW_WHITESPACE, IDM_VIEW_WRAP, IDM_VIEW_ZOOM_IN, IDM_VIEW_ZOOM_OUT,
+    IDM_VIEW_ZOOM_RESET,
 };
 
 #[inline]
@@ -140,7 +141,7 @@ impl AppState {
                     OUT_DEFAULT_PRECIS as u32,
                     CLIP_DEFAULT_PRECIS as u32,
                     CLEARTYPE_QUALITY as u32,
-                    (FIXED_PITCH as u32) | (FF_MODERN as u32),
+                    DEFAULT_PITCH as u32,
                     wname.as_ptr(),
                 )
             };
@@ -164,11 +165,11 @@ impl AppState {
 
     pub fn update_gutter_width(&mut self) {
         if !self.cfg.show_line_numbers {
-            self.gutter_w = 14;
+            self.gutter_w = 6 + FOLD_COL_W;
             return;
         }
         let digits = self.doc.line_count().max(1).to_string().len().max(3);
-        self.gutter_w = (digits as i32 * self.avg_char_w) + 22;
+        self.gutter_w = (digits as i32 * self.avg_char_w) + 16 + FOLD_COL_W;
     }
 
     fn outline_panel_width(&self) -> i32 {
@@ -206,33 +207,51 @@ impl AppState {
             let mut acc = 0usize;
             self.visual_prefix.push(0);
             for &cnt in &self.line_row_counts {
-                acc += cnt.max(1);
+                acc += cnt;
                 self.visual_prefix.push(acc);
             }
             return;
         }
         let mut acc = self.visual_prefix[start_line];
         for i in start_line..self.line_row_counts.len() {
-            acc += self.line_row_counts[i].max(1);
+            acc += self.line_row_counts[i];
             self.visual_prefix[i + 1] = acc;
         }
     }
 
-    pub fn reset_wraps_lazy(&mut self) {
-        self.doc.wrap_patches.clear();
-        if !self.wrap_active() {
-            self.line_wraps.clear();
-            self.line_row_counts.clear();
-            self.visual_prefix.clear();
-            self.wrap_max_px_cached = 0;
+    pub fn rebuild_fold_row_counts(&mut self) {
+        let count = self.doc.line_count();
+        if self.line_wraps.len() != count || self.line_row_counts.len() != count {
+            self.reset_wraps_lazy();
+            self.update_scrollbars();
             return;
         }
+        let max_px = self.wrap_max_px().max(1);
+        let est_cols = ((max_px / self.avg_char_w.max(6)).max(8)) as usize;
+        for l in 0..count {
+            if self.doc.line_hidden.get(l).copied().unwrap_or(false) {
+                self.line_row_counts[l] = 0;
+            } else if !self.wrap_active() {
+                self.line_row_counts[l] = 1;
+            } else if let Some(Some(segs)) = self.line_wraps.get(l) {
+                self.line_row_counts[l] = segs.len().max(1);
+            } else {
+                let (s, e) = self.doc.line_bounds(l);
+                self.line_row_counts[l] = ((e - s) / est_cols.max(1)).max(1);
+            }
+        }
+        self.rebuild_visual_prefix_from(0);
+        self.update_scrollbars();
+    }
+
+    pub fn reset_wraps_lazy(&mut self) {
+        self.doc.wrap_patches.clear();
+        let count = self.doc.line_count();
         if self.client_w <= 60 {
             return;
         }
         let max_px = self.wrap_max_px();
-        self.wrap_max_px_cached = max_px;
-        let count = self.doc.line_count();
+        self.wrap_max_px_cached = if self.wrap_active() { max_px } else { 0 };
         let est_cols = ((max_px / self.avg_char_w.max(6)).max(8)) as usize;
 
         self.line_wraps.clear();
@@ -240,15 +259,24 @@ impl AppState {
         self.line_row_counts.clear();
         self.line_row_counts.reserve(count);
         for l in 0..count {
-            let (s, e) = self.doc.line_bounds(l);
-            let est = ((e - s) / est_cols.max(1)).max(1);
-            self.line_row_counts.push(est);
+            if self.doc.line_hidden.get(l).copied().unwrap_or(false) {
+                self.line_row_counts.push(0);
+            } else if !self.wrap_active() {
+                self.line_row_counts.push(1);
+            } else {
+                let (s, e) = self.doc.line_bounds(l);
+                let est = ((e - s) / est_cols.max(1)).max(1);
+                self.line_row_counts.push(est);
+            }
         }
         self.rebuild_visual_prefix_from(0);
     }
 
     fn ensure_line_wrapped_with_dc(&mut self, hdc: HDC, line: usize) -> bool {
         if !self.wrap_active() || line >= self.doc.line_count() {
+            return false;
+        }
+        if self.doc.line_hidden.get(line).copied().unwrap_or(false) {
             return false;
         }
         if self.line_wraps.len() != self.doc.line_count() {
@@ -326,15 +354,16 @@ impl AppState {
 
     pub fn sync_wraps_after_edit(&mut self) {
         let patches: Vec<(usize, usize, usize)> = self.doc.wrap_patches.drain(..).collect();
-        if !self.wrap_active() {
-            return;
-        }
         let max_px = self.wrap_max_px();
-        if self.line_wraps.is_empty() || max_px != self.wrap_max_px_cached {
+        if self.line_wraps.len() == 0 || (self.wrap_active() && max_px != self.wrap_max_px_cached) {
             self.reset_wraps_lazy();
             return;
         }
         if patches.is_empty() && self.line_wraps.len() == self.doc.line_count() {
+            return;
+        }
+        if self.doc.line_folded.iter().any(|&f| f) {
+            self.reset_wraps_lazy();
             return;
         }
         let est_cols = ((max_px / self.avg_char_w.max(6)).max(8)) as usize;
@@ -348,7 +377,10 @@ impl AppState {
                     return;
                 }
                 min_dirty = min_dirty.min(start_line);
-                if new_count <= 24 {
+                if !self.wrap_active() {
+                    self.line_wraps.splice(start_line..(start_line + old_count), vec![None; new_count]);
+                    self.line_row_counts.splice(start_line..(start_line + old_count), vec![1; new_count]);
+                } else if new_count <= 24 {
                     let mut rep_wraps = Vec::with_capacity(new_count);
                     let mut rep_counts = Vec::with_capacity(new_count);
                     for l in start_line..(start_line + new_count) {
@@ -400,48 +432,46 @@ impl AppState {
     }
 
     pub fn total_visual_lines(&self) -> usize {
-        if self.wrap_active() {
-            self.visual_prefix.last().copied().unwrap_or(1).max(1)
-        } else {
-            self.doc.line_count().max(1)
-        }
+        self.visual_prefix.last().copied().unwrap_or(1).max(1)
     }
 
     pub fn get_visual_seg(&self, vrow: usize) -> Option<VisualSeg> {
+        let total = self.total_visual_lines();
+        if vrow >= total || self.visual_prefix.len() <= 1 {
+            return None;
+        }
+        let line = self.visual_prefix.partition_point(|&p| p <= vrow).saturating_sub(1);
+        if line >= self.doc.line_count() || self.doc.line_hidden.get(line).copied().unwrap_or(false) {
+            return None;
+        }
         if self.wrap_active() {
-            let total = self.total_visual_lines();
-            if vrow >= total || self.line_wraps.is_empty() {
-                return None;
-            }
-            let line = self.visual_prefix.partition_point(|&p| p <= vrow).saturating_sub(1);
             let seg_idx = vrow - self.visual_prefix[line];
             if let Some(Some(segs)) = self.line_wraps.get(line) {
                 let (bs, be) = segs.get(seg_idx).copied().unwrap_or_else(|| {
                     let (s, e) = self.doc.line_bounds(line);
                     (0, e - s)
                 });
-                Some(VisualSeg { line, b_start: bs, b_end: be })
-            } else {
-                let (s, e) = self.doc.line_bounds(line);
-                Some(VisualSeg { line, b_start: 0, b_end: e - s })
+                return Some(VisualSeg { line, b_start: bs, b_end: be });
             }
-        } else if vrow < self.doc.line_count() {
-            let (s, e) = self.doc.line_bounds(vrow);
-            Some(VisualSeg { line: vrow, b_start: 0, b_end: e - s })
-        } else {
-            None
         }
+        let (s, e) = self.doc.line_bounds(line);
+        Some(VisualSeg { line, b_start: 0, b_end: e - s })
     }
 
     pub fn byte_to_visual_row(&mut self, byte_pos: usize) -> usize {
         let line = self.doc.line_of_byte(byte_pos);
-        if !self.wrap_active() {
-            return line;
+        if self.doc.ensure_line_unfolded(line) {
+            self.rebuild_fold_row_counts();
         }
-        self.ensure_single_line_wrapped(line);
+        if self.wrap_active() {
+            self.ensure_single_line_wrapped(line);
+        }
+        let base = *self.visual_prefix.get(line).unwrap_or(&0);
+        if !self.wrap_active() {
+            return base;
+        }
         let line_start = self.doc.line_starts[line];
         let rel = byte_pos.saturating_sub(line_start);
-        let base = *self.visual_prefix.get(line).unwrap_or(&0);
         if let Some(Some(segs)) = self.line_wraps.get(line) {
             for (idx, &(_, be)) in segs.iter().enumerate() {
                 if rel <= be {
@@ -508,6 +538,25 @@ impl AppState {
         } else if vrow >= self.scroll_y + page {
             self.scroll_y = vrow + 1 - page;
         }
+
+        if !self.wrap_active() {
+            let x = self.measure_byte_x(head);
+            let edit_w = (self.editor_right() - self.gutter_w - 24).max(40);
+            if x < self.scroll_x {
+                self.scroll_x = (x - 40).max(0);
+            } else if x > self.scroll_x + edit_w {
+                self.scroll_x = x - edit_w + 40;
+            }
+        }
+        self.update_scrollbars();
+    }
+
+    pub fn center_caret_in_view(&mut self) {
+        let head = self.doc.primary().head;
+        let vrow = self.byte_to_visual_row(head);
+        let page = self.visible_row_count();
+        let max_y = self.total_visual_lines().saturating_sub(1);
+        self.scroll_y = vrow.saturating_sub(page / 2).min(max_y.saturating_sub(page.saturating_sub(1)));
 
         if !self.wrap_active() {
             let x = self.measure_byte_x(head);
@@ -670,7 +719,7 @@ impl AppState {
                         fy,
                         fw,
                         fh,
-                        self.hwnd, // Owner 设为正文主窗：浮动时始终位于正文框上方
+                        self.hwnd,
                         null_mut(),
                         hinst,
                         null(),
@@ -716,9 +765,7 @@ impl AppState {
         }
     }
 
-    pub fn refresh_search_ui(&mut self) {
-        let caret = self.doc.primary().head;
-        self.search.recompute(&self.doc.text, caret);
+    pub fn update_search_count_label(&self) {
         let text = if let Some(err) = &self.search.last_error {
             format!("正则错误: {}", err)
         } else if self.search.query.is_empty() {
@@ -733,6 +780,23 @@ impl AppState {
         unsafe {
             SetWindowTextW(self.lbl_count, wt.as_ptr());
         }
+    }
+
+    pub fn refresh_search_ui(&mut self) {
+        let caret = self.doc.primary().head;
+        self.search.recompute(&self.doc.text, caret);
+        self.update_search_count_label();
+        self.invalidate();
+    }
+
+    pub fn jump_to_search_match(&mut self, ms: usize, me: usize) {
+        let target_line = self.doc.line_of_byte(ms);
+        if self.doc.ensure_line_unfolded(target_line) {
+            self.rebuild_fold_row_counts();
+        }
+        self.doc.cursors = vec![Cursor { anchor: ms, head: me }];
+        self.center_caret_in_view();
+        self.update_search_count_label();
         self.invalidate();
     }
 
@@ -946,6 +1010,10 @@ fn show_editor_context_menu(state: &AppState, mx: i32, my: i32) {
         add(IDM_EDIT_DEL_LINE, "删除当前行\tCtrl+Shift+K", true, false);
         add(IDM_EDIT_COMMENT, "切换引用 / 注释\tCtrl+/", true, false);
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        add(IDM_VIEW_FOLD_TOGGLE, "折叠 / 展开当前标题\tCtrl+M", true, false);
+        add(IDM_VIEW_FOLD_ALL, "全部折叠正文标题", true, false);
+        add(IDM_VIEW_UNFOLD_ALL, "全部展开正文标题", true, false);
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
         add(IDM_SEARCH_FIND, "查找(&F)...\tCtrl+F", true, false);
         add(IDM_SEARCH_REPLACE, "替换(&H)...\tCtrl+H", true, false);
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
@@ -1024,6 +1092,9 @@ fn handle_outline_click(state: &mut AppState, x: i32, y: i32, left: i32, right: 
     }
 
     state.outline.selected_idx = Some(node_idx);
+    if state.doc.ensure_line_unfolded(node.line) {
+        state.rebuild_fold_row_counts();
+    }
     state.doc.cursors = vec![Cursor::collapsed(node.byte_pos)];
     let target_vrow = state.byte_to_visual_row(node.byte_pos);
     let max_y = state.total_visual_lines().saturating_sub(1);
@@ -1293,10 +1364,9 @@ pub fn handle_command(state: &mut AppState, id: usize) {
                 if state.search.matches.is_empty() {
                     state.refresh_search_ui();
                 }
-                if let Some((ms, me)) = state.search.step(id == IDM_SEARCH_NEXT) {
-                    state.doc.cursors = vec![Cursor { anchor: ms, head: me }];
-                    state.ensure_caret_visible();
-                    state.invalidate();
+                let sel = state.doc.primary().range();
+                if let Some((ms, me)) = state.search.step_from_caret(id == IDM_SEARCH_NEXT, sel) {
+                    state.jump_to_search_match(ms, me);
                 }
             } else {
                 state.show_find_panel(false);
@@ -1323,6 +1393,38 @@ pub fn handle_command(state: &mut AppState, id: usize) {
             state.cfg.show_whitespace = !state.cfg.show_whitespace;
             state.reset_wraps_lazy();
             save_config(&state.cfg);
+            state.invalidate();
+        }
+        IDM_VIEW_FOLD_TOGGLE => {
+            let cur_line = state.doc.line_of_byte(state.doc.primary().head);
+            if let Some(hl) = state.doc.heading_for_line(cur_line) {
+                if state.doc.toggle_fold_at_line(hl) {
+                    let pos = state.doc.line_bounds(hl).0;
+                    state.doc.cursors = vec![Cursor::collapsed(pos)];
+                    state.rebuild_fold_row_counts();
+                    state.ensure_caret_visible();
+                    state.invalidate();
+                }
+            }
+        }
+        IDM_VIEW_FOLD_ALL => {
+            state.doc.set_all_folds(true);
+            let cur_line = state.doc.line_of_byte(state.doc.primary().head);
+            if state.doc.line_hidden.get(cur_line).copied().unwrap_or(false) {
+                if let Some(hl) = state.doc.heading_for_line(cur_line) {
+                    state.doc.cursors = vec![Cursor::collapsed(state.doc.line_bounds(hl).0)];
+                } else {
+                    state.doc.cursors = vec![Cursor::collapsed(0)];
+                }
+            }
+            state.rebuild_fold_row_counts();
+            state.ensure_caret_visible();
+            state.invalidate();
+        }
+        IDM_VIEW_UNFOLD_ALL => {
+            state.doc.set_all_folds(false);
+            state.rebuild_fold_row_counts();
+            state.ensure_caret_visible();
             state.invalidate();
         }
         IDM_VIEW_OUTLINE => {
@@ -1422,6 +1524,7 @@ fn handle_keydown(state: &mut AppState, vk: u16) -> bool {
             0x4F if shift => { handle_command(state, IDM_VIEW_OUTLINE); return true; }
             0x4F => { handle_command(state, IDM_FILE_OPEN); return true; }
             0x4C if shift => { handle_command(state, IDM_VIEW_LINENUM); return true; }
+            0x4D => { handle_command(state, IDM_VIEW_FOLD_TOGGLE); return true; }
             0x53 => { handle_command(state, if shift { IDM_FILE_SAVEAS } else { IDM_FILE_SAVE }); return true; }
             0x5A => { handle_command(state, IDM_EDIT_UNDO); return true; }
             0x59 => { handle_command(state, IDM_EDIT_REDO); return true; }
@@ -1482,7 +1585,7 @@ fn handle_keydown(state: &mut AppState, vk: u16) -> bool {
     };
 
     let head = state.doc.primary().head;
-    let (line, col) = state.doc.byte_to_line_col(head);
+    let (line, _) = state.doc.byte_to_line_col(head);
     match vk {
         VK_LEFT => {
             if !shift && state.doc.primary().has_selection() {
@@ -1503,28 +1606,18 @@ fn handle_keydown(state: &mut AppState, vk: u16) -> bool {
             true
         }
         VK_UP => {
-            if state.wrap_active() {
-                let vrow = state.byte_to_visual_row(head);
-                let x = state.measure_byte_x(head);
-                let (pos, _, _) = state.hit_test_vrow_x(vrow.saturating_sub(1), x);
-                move_cursor(state, pos);
-            } else {
-                let nl = line.saturating_sub(1);
-                move_cursor(state, state.doc.line_col_to_byte(nl, col));
-            }
+            let vrow = state.byte_to_visual_row(head);
+            let x = state.measure_byte_x(head);
+            let (pos, _, _) = state.hit_test_vrow_x(vrow.saturating_sub(1), x);
+            move_cursor(state, pos);
             true
         }
         VK_DOWN => {
-            if state.wrap_active() {
-                let vrow = state.byte_to_visual_row(head);
-                let x = state.measure_byte_x(head);
-                let target_vrow = (vrow + 1).min(state.total_visual_lines().saturating_sub(1));
-                let (pos, _, _) = state.hit_test_vrow_x(target_vrow, x);
-                move_cursor(state, pos);
-            } else {
-                let nl = (line + 1).min(state.doc.line_count().saturating_sub(1));
-                move_cursor(state, state.doc.line_col_to_byte(nl, col));
-            }
+            let vrow = state.byte_to_visual_row(head);
+            let x = state.measure_byte_x(head);
+            let target_vrow = (vrow + 1).min(state.total_visual_lines().saturating_sub(1));
+            let (pos, _, _) = state.hit_test_vrow_x(target_vrow, x);
+            move_cursor(state, pos);
             true
         }
         VK_HOME => {
@@ -1564,28 +1657,18 @@ fn handle_keydown(state: &mut AppState, vk: u16) -> bool {
         }
         VK_PRIOR => {
             let step = state.visible_row_count();
-            if state.wrap_active() {
-                let vrow = state.byte_to_visual_row(head).saturating_sub(step);
-                let x = state.measure_byte_x(head);
-                let (pos, _, _) = state.hit_test_vrow_x(vrow, x);
-                move_cursor(state, pos);
-            } else {
-                let nl = line.saturating_sub(step);
-                move_cursor(state, state.doc.line_col_to_byte(nl, col));
-            }
+            let vrow = state.byte_to_visual_row(head).saturating_sub(step);
+            let x = state.measure_byte_x(head);
+            let (pos, _, _) = state.hit_test_vrow_x(vrow, x);
+            move_cursor(state, pos);
             true
         }
         VK_NEXT => {
             let step = state.visible_row_count();
-            if state.wrap_active() {
-                let vrow = (state.byte_to_visual_row(head) + step).min(state.total_visual_lines().saturating_sub(1));
-                let x = state.measure_byte_x(head);
-                let (pos, _, _) = state.hit_test_vrow_x(vrow, x);
-                move_cursor(state, pos);
-            } else {
-                let nl = (line + step).min(state.doc.line_count().saturating_sub(1));
-                move_cursor(state, state.doc.line_col_to_byte(nl, col));
-            }
+            let vrow = (state.byte_to_visual_row(head) + step).min(state.total_visual_lines().saturating_sub(1));
+            let x = state.measure_byte_x(head);
+            let (pos, _, _) = state.hit_test_vrow_x(vrow, x);
+            move_cursor(state, pos);
             true
         }
         VK_BACK => {
@@ -1638,6 +1721,10 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
             0
         }
         WM_SETCURSOR => {
+            // 来自子控件（如查找面板按钮/标签）的光标事件直接交还 DefWindowProcW
+            if wp as HWND != hwnd {
+                return DefWindowProcW(hwnd, msg, wp, lp);
+            }
             if loword(lp as usize) as u32 == HTCLIENT as u32 {
                 let mut pt: POINT = std::mem::zeroed();
                 GetCursorPos(&mut pt);
@@ -1717,6 +1804,17 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
             if docked_outline && mx >= edit_r && my < st.client_h - STATUS_BAR_HEIGHT {
                 handle_outline_click(st, mx, my, edit_r, st.client_w);
                 return 0;
+            }
+            if mx >= st.gutter_w - FOLD_COL_W && mx < st.gutter_w && my < st.client_h - STATUS_BAR_HEIGHT {
+                let vrow = st.scroll_y + (my.max(0) / st.line_h.max(1)) as usize;
+                if let Some(seg) = st.get_visual_seg(vrow) {
+                    if seg.b_start == 0 && st.doc.line_levels.get(seg.line).copied().unwrap_or(0) > 0 {
+                        st.doc.toggle_fold_at_line(seg.line);
+                        st.rebuild_fold_row_counts();
+                        st.invalidate();
+                        return 0;
+                    }
+                }
             }
 
             SetFocus(hwnd);
