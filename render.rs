@@ -250,7 +250,6 @@ pub fn compute_line_wraps_with_dc(
         return vec![(0, 0)];
     }
 
-    // 仅对超过 2MB 的极端单行走快速列切分，避免单行卡顿
     if line_str.len() > 2 * 1024 * 1024 {
         let cols = (max_px / avg_char_w.max(6)).max(12) as usize;
         let mut segs = Vec::new();
@@ -298,7 +297,6 @@ pub fn compute_line_wraps_with_dc(
             if fit == u16_len && chunk_end < rem.len() {
                 chunk_chars = (chunk_chars * 2).min(4096);
                 if chunk_chars == 4096 && chunk_end < rem.len() {
-                    // 极窄字符超长行继续扩大
                     chunk_chars = rem.len();
                 }
                 continue;
@@ -341,7 +339,7 @@ pub fn compute_line_wraps_with_dc(
 }
 
 // ============================================================================
-// 3. 括号匹配与双缓冲 GDI 渲染器（编辑区 + 大纲栏 + 状态栏）
+// 3. 括号匹配、大纲面板与双缓冲 GDI 渲染器
 // ============================================================================
 
 fn find_matching_bracket(doc: &Document, pos: usize) -> Option<(usize, usize)> {
@@ -394,7 +392,15 @@ fn find_matching_bracket(doc: &Document, pos: usize) -> Option<(usize, usize)> {
     None
 }
 
-fn paint_outline_panel(state: &AppState, mem_dc: HDC, theme: Theme, left: i32, right: i32, bottom: i32) {
+pub fn paint_outline_panel(
+    state: &AppState,
+    mem_dc: HDC,
+    theme: Theme,
+    left: i32,
+    right: i32,
+    bottom: i32,
+    floating: bool,
+) {
     unsafe {
         let bg_br = CreateSolidBrush(theme.outline_bg);
         let rc = RECT { left, top: 0, right, bottom };
@@ -407,25 +413,30 @@ fn paint_outline_panel(state: &AppState, mem_dc: HDC, theme: Theme, left: i32, r
         DeleteObject(hdr_br as _);
 
         let sep_br = CreateSolidBrush(theme.status_border);
-        let v_sep = RECT { left, top: 0, right: left + 1, bottom };
-        FillRect(mem_dc, &v_sep, sep_br);
+        if !floating {
+            let v_sep = RECT { left, top: 0, right: left + 1, bottom };
+            FillRect(mem_dc, &v_sep, sep_br);
+        }
         let h_sep = RECT { left, top: OUTLINE_HEADER_H - 1, right, bottom: OUTLINE_HEADER_H };
         FillRect(mem_dc, &h_sep, sep_br);
         DeleteObject(sep_br as _);
 
         SelectObject(mem_dc, state.hfont_ui_bold as _);
         SetTextColor(mem_dc, theme.outline_fg);
-        let title_w = to_wide("Markdown 大纲");
-        let mut trc = RECT { left: left + 10, top: 6, right: right - 115, bottom: OUTLINE_HEADER_H - 2 };
+        let title_w = to_wide(if floating { "大纲 (拖动移动)" } else { "Markdown 大纲" });
+        let mut trc = RECT { left: left + 8, top: 6, right: right - 138, bottom: OUTLINE_HEADER_H - 2 };
         DrawTextW(mem_dc, title_w.as_ptr(), (title_w.len() - 1) as i32, &mut trc, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS);
 
+        // 顶部 5 个按钮：[刷新] [展] [折] [浮/停] [×]
         SelectObject(mem_dc, state.hfont_ui as _);
         let btn_br = CreateSolidBrush(theme.outline_btn_bg);
+        let mode_lbl = if floating { "停" } else { "浮" };
         let btns = [
-            (right - 112, right - 76, "刷新"),
-            (right - 72, right - 42, "展"),
-            (right - 38, right - 22, "折"),
-            (right - 18, right - 4, "×"),
+            (right - 134, right - 95, "刷新"),
+            (right - 92, right - 72, "展"),
+            (right - 69, right - 49, "折"),
+            (right - 46, right - 25, mode_lbl),
+            (right - 22, right - 4, "×"),
         ];
         for (bx1, bx2, label) in btns {
             let brc = RECT { left: bx1, top: 5, right: bx2, bottom: OUTLINE_HEADER_H - 5 };
@@ -494,8 +505,28 @@ fn paint_outline_panel(state: &AppState, mem_dc: HDC, theme: Theme, left: i32, r
     }
 }
 
+pub fn paint_floating_outline(state: &AppState, hdc_win: HDC, w: i32, h: i32) {
+    let cw = w.max(1);
+    let ch = h.max(1);
+    let theme = get_theme(state.cfg.dark_theme);
+    unsafe {
+        let mem_dc = CreateCompatibleDC(hdc_win);
+        let bmp = CreateCompatibleBitmap(hdc_win, cw, ch);
+        let old_bmp = SelectObject(mem_dc, bmp as _);
+        let old_font = SelectObject(mem_dc, state.hfont_ui as _);
+        SetBkMode(mem_dc, TRANSPARENT as i32);
+
+        paint_outline_panel(state, mem_dc, theme, 0, cw, ch, true);
+
+        SelectObject(mem_dc, old_font);
+        BitBlt(hdc_win, 0, 0, cw, ch, mem_dc, 0, 0, SRCCOPY);
+        SelectObject(mem_dc, old_bmp);
+        DeleteObject(bmp as _);
+        DeleteDC(mem_dc);
+    }
+}
+
 pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
-    // 仅在绘制前对视口可见行做像素级精确折行（惰性按需缓存）
     state.ensure_viewport_wraps();
 
     let w = state.client_w.max(1);
@@ -605,23 +636,23 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
                 SelectObject(mem_dc, old_pen);
             }
 
+            let safe_bs = floor_char_boundary(full_line, seg.b_start);
+            let safe_be = floor_char_boundary(full_line, seg.b_end).max(safe_bs);
             let line_abs_start = state.doc.line_starts[seg.line];
-            let seg_abs_start = line_abs_start + seg.b_start;
-            let seg_abs_end = line_abs_start + seg.b_end;
-            let seg_str = &full_line[seg.b_start..seg.b_end];
+            let seg_abs_start = line_abs_start + safe_bs;
+            let seg_abs_end = line_abs_start + safe_be;
+            let seg_str = &full_line[safe_bs..safe_be];
 
             let draw_slice = if seg_str.len() > 16_384 {
-                let mut e = 16_384;
-                while !seg_str.is_char_boundary(e) {
-                    e -= 1;
-                }
+                let e = floor_char_boundary(seg_str, 16_384);
                 &seg_str[..e]
             } else {
                 seg_str
             };
 
             let seg_x = |abs_byte: usize| -> i32 {
-                let rel = abs_byte.saturating_sub(seg_abs_start).min(draw_slice.len());
+                let raw_rel = abs_byte.saturating_sub(seg_abs_start).min(draw_slice.len());
+                let rel = floor_char_boundary(draw_slice, raw_rel);
                 let sub = &draw_slice[..rel];
                 if sub.is_empty() {
                     return text_left;
@@ -699,15 +730,16 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
                 *x_acc += sz.cx;
             };
 
-            let seg_end_rel = seg.b_start + draw_slice.len();
+            let seg_end_rel = safe_bs + draw_slice.len();
             for &(ts, te, kind) in &cached_tokens {
-                if te <= seg.b_start || ts >= seg_end_rel {
+                if te <= safe_bs || ts >= seg_end_rel {
                     continue;
                 }
-                let ls = ts.saturating_sub(seg.b_start);
-                let le = te.min(seg_end_rel) - seg.b_start;
-                if ls > pos {
-                    draw_chunk(&draw_slice[pos..ls], theme.text_fg, state.hfont_regular, false, &mut cur_x, &mut cur_col);
+                let ls = floor_char_boundary(draw_slice, ts.saturating_sub(safe_bs));
+                let le = floor_char_boundary(draw_slice, te.min(seg_end_rel) - safe_bs);
+                let p_safe = floor_char_boundary(draw_slice, pos);
+                if ls > p_safe {
+                    draw_chunk(&draw_slice[p_safe..ls], theme.text_fg, state.hfont_regular, false, &mut cur_x, &mut cur_col);
                 }
                 let (tcol, tfont, has_bg) = match kind {
                     TokenKind::Keyword => (theme.kw_fg, state.hfont_regular, false),
@@ -728,14 +760,15 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
                 if le > ls {
                     draw_chunk(&draw_slice[ls..le], tcol, tfont, has_bg, &mut cur_x, &mut cur_col);
                 }
-                pos = pos.max(le);
+                pos = p_safe.max(le);
             }
-            if pos < draw_slice.len() {
-                draw_chunk(&draw_slice[pos..], theme.text_fg, state.hfont_regular, false, &mut cur_x, &mut cur_col);
+            let p_safe = floor_char_boundary(draw_slice, pos);
+            if p_safe < draw_slice.len() {
+                draw_chunk(&draw_slice[p_safe..], theme.text_fg, state.hfont_regular, false, &mut cur_x, &mut cur_col);
             }
 
             for c in &state.doc.cursors {
-                let in_seg = if seg.b_end == full_line.len() {
+                let in_seg = if safe_be == full_line.len() {
                     c.head >= seg_abs_start && c.head <= seg_abs_end
                 } else {
                     c.head >= seg_abs_start && c.head < seg_abs_end
@@ -763,7 +796,7 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
         DeleteObject(hr_pen as _);
 
         if edit_r < w {
-            paint_outline_panel(state, mem_dc, theme, edit_r, w, edit_b);
+            paint_outline_panel(state, mem_dc, theme, edit_r, w, edit_b, false);
         }
 
         let sb_top = h - STATUS_BAR_HEIGHT;
