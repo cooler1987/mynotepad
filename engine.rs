@@ -1,6 +1,6 @@
 use chrono::Local;
 use encoding_rs::{Encoding, BIG5, GB18030, UTF_16BE, UTF_16LE, UTF_8};
-use regex_lite::RegexBuilder;
+use regex_lite::{Captures, Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::ffi::OsStr;
@@ -25,6 +25,15 @@ pub fn to_wide(s: &str) -> Vec<u16> {
 pub fn from_wide_slice(slice: &[u16]) -> String {
     let end = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
     String::from_utf16_lossy(&slice[..end])
+}
+
+#[inline]
+pub fn floor_char_boundary(s: &str, pos: usize) -> usize {
+    let mut p = pos.min(s.len());
+    while p > 0 && !s.is_char_boundary(p) {
+        p -= 1;
+    }
+    p
 }
 
 // ============================================================================
@@ -110,6 +119,11 @@ pub struct AppConfig {
     pub always_on_top: bool,
     pub outline_visible: bool,
     pub outline_width: i32,
+    pub outline_floating: bool,
+    pub outline_x: i32,
+    pub outline_y: i32,
+    pub outline_float_w: i32,
+    pub outline_float_h: i32,
     pub recent_files: Vec<String>,
 }
 
@@ -132,6 +146,11 @@ impl Default for AppConfig {
             always_on_top: false,
             outline_visible: false,
             outline_width: 245,
+            outline_floating: false,
+            outline_x: CW_USEDEFAULT,
+            outline_y: CW_USEDEFAULT,
+            outline_float_w: 270,
+            outline_float_h: 440,
             recent_files: Vec::new(),
         }
     }
@@ -396,15 +415,6 @@ struct UndoEntry {
     cursors_after: Vec<Cursor>,
 }
 
-#[inline]
-fn clamp_str_boundary(s: &str, pos: usize) -> usize {
-    let mut p = pos.min(s.len());
-    while p > 0 && !s.is_char_boundary(p) {
-        p -= 1;
-    }
-    p
-}
-
 pub struct Document {
     pub text: String,
     pub line_starts: Vec<usize>,
@@ -575,7 +585,7 @@ impl Document {
     }
 
     pub fn clamp_char_boundary(&self, pos: usize) -> usize {
-        clamp_str_boundary(&self.text, pos)
+        floor_char_boundary(&self.text, pos)
     }
 
     pub fn prev_char_boundary(&self, pos: usize) -> usize {
@@ -612,8 +622,8 @@ impl Document {
             return;
         }
         for c in &mut self.cursors {
-            c.anchor = clamp_str_boundary(&self.text, c.anchor);
-            c.head = clamp_str_boundary(&self.text, c.head);
+            c.anchor = floor_char_boundary(&self.text, c.anchor);
+            c.head = floor_char_boundary(&self.text, c.head);
         }
         if self.cursors.len() > 1 {
             self.cursors.sort_by_key(|c| c.range());
@@ -948,8 +958,99 @@ impl Document {
 }
 
 // ============================================================================
-// 5. 查找与正则替换引擎
+// 5. 查找与正则替换引擎（支持 multi_line ^/$、$1/${1}/\1 捕获组及 \n/\t 转义）
 // ============================================================================
+
+fn expand_regex_template(template: &str, caps: &Captures<'_>) -> String {
+    let mut out = String::with_capacity(template.len() + 16);
+    let b = template.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'$' && i + 1 < b.len() {
+            let next = b[i + 1];
+            if next == b'$' {
+                out.push('$');
+                i += 2;
+                continue;
+            }
+            if next == b'&' {
+                if let Some(m) = caps.get(0) {
+                    out.push_str(m.as_str());
+                }
+                i += 2;
+                continue;
+            }
+            if next == b'{' {
+                if let Some(close_rel) = template[i + 2..].find('}') {
+                    let inner = &template[i + 2..i + 2 + close_rel];
+                    if let Ok(idx) = inner.parse::<usize>() {
+                        if let Some(m) = caps.get(idx) {
+                            out.push_str(m.as_str());
+                        }
+                        i = i + 2 + close_rel + 1;
+                        continue;
+                    }
+                }
+            }
+            if next.is_ascii_digit() {
+                let mut end = i + 2;
+                if end < b.len() && b[end].is_ascii_digit() {
+                    end += 1;
+                }
+                if let Ok(idx) = template[i + 1..end].parse::<usize>() {
+                    if let Some(m) = caps.get(idx) {
+                        out.push_str(m.as_str());
+                    }
+                    i = end;
+                    continue;
+                }
+            }
+        } else if b[i] == b'\\' && i + 1 < b.len() {
+            let next = b[i + 1];
+            match next {
+                b'n' => {
+                    out.push('\n');
+                    i += 2;
+                    continue;
+                }
+                b'r' => {
+                    if i + 3 < b.len() && b[i + 2] == b'\\' && b[i + 3] == b'n' {
+                        out.push('\n');
+                        i += 4;
+                    } else {
+                        out.push('\n');
+                        i += 2;
+                    }
+                    continue;
+                }
+                b't' => {
+                    out.push('\t');
+                    i += 2;
+                    continue;
+                }
+                b'\\' => {
+                    out.push('\\');
+                    i += 2;
+                    continue;
+                }
+                b'0'..=b'9' => {
+                    let idx = (next - b'0') as usize;
+                    if let Some(m) = caps.get(idx) {
+                        out.push_str(m.as_str());
+                    }
+                    i += 2;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        let ch = template[i..].chars().next().unwrap_or(' ');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    let (norm, _) = normalize_newlines_fast(&out);
+    norm
+}
 
 pub struct SearchState {
     pub visible: bool,
@@ -980,13 +1081,7 @@ impl SearchState {
         }
     }
 
-    pub fn recompute(&mut self, text: &str, caret: usize) {
-        self.matches.clear();
-        self.current_idx = None;
-        self.last_error = None;
-        if self.query.is_empty() {
-            return;
-        }
+    fn build_regex(&self) -> Result<Regex, String> {
         let mut pattern = if self.use_regex {
             self.query.clone()
         } else {
@@ -995,13 +1090,24 @@ impl SearchState {
         if self.whole_word {
             pattern = format!(r"\b(?:{})\b", pattern);
         }
-        let re = match RegexBuilder::new(&pattern)
+        RegexBuilder::new(&pattern)
             .case_insensitive(!self.case_sensitive)
+            .multi_line(true)
             .build()
-        {
+            .map_err(|e| e.to_string())
+    }
+
+    pub fn recompute(&mut self, text: &str, caret: usize) {
+        self.matches.clear();
+        self.current_idx = None;
+        self.last_error = None;
+        if self.query.is_empty() {
+            return;
+        }
+        let re = match self.build_regex() {
             Ok(r) => r,
             Err(e) => {
-                self.last_error = Some(e.to_string());
+                self.last_error = Some(e);
                 return;
             }
         };
@@ -1019,6 +1125,64 @@ impl SearchState {
             let idx = self.matches.iter().position(|&(s, _)| s >= caret).unwrap_or(0);
             self.current_idx = Some(idx);
         }
+    }
+
+    pub fn expand_single_replace(&self, doc: &Document, ms: usize, me: usize) -> String {
+        if !self.use_regex {
+            let (norm, _) = normalize_newlines_fast(&self.replace_with);
+            return norm;
+        }
+        let Ok(re) = self.build_regex() else {
+            return self.replace_with.clone();
+        };
+        let l1 = doc.line_of_byte(ms);
+        let l2 = doc.line_of_byte(me);
+        let (ctx_s, _) = doc.line_bounds(l1);
+        let (_, ctx_e) = doc.line_bounds(l2);
+        let slice = &doc.text[ctx_s..ctx_e];
+        for caps in re.captures_iter(slice) {
+            if let Some(m) = caps.get(0) {
+                if ctx_s + m.start() == ms && ctx_s + m.end() == me {
+                    return expand_regex_template(&self.replace_with, &caps);
+                }
+            }
+        }
+        if let Some(caps) = re.captures(&doc.text[ms..me]) {
+            return expand_regex_template(&self.replace_with, &caps);
+        }
+        self.replace_with.clone()
+    }
+
+    pub fn build_replace_all_edits(&mut self, text: &str) -> Vec<(usize, usize, String)> {
+        self.last_error = None;
+        if self.query.is_empty() {
+            return Vec::new();
+        }
+        let re = match self.build_regex() {
+            Ok(r) => r,
+            Err(e) => {
+                self.last_error = Some(e);
+                return Vec::new();
+            }
+        };
+        let mut edits = Vec::new();
+        if !self.use_regex {
+            let (lit, _) = normalize_newlines_fast(&self.replace_with);
+            for m in re.find_iter(text) {
+                if m.start() < m.end() {
+                    edits.push((m.start(), m.end(), lit.clone()));
+                }
+            }
+        } else {
+            for caps in re.captures_iter(text) {
+                if let Some(m) = caps.get(0) {
+                    if m.start() < m.end() {
+                        edits.push((m.start(), m.end(), expand_regex_template(&self.replace_with, &caps)));
+                    }
+                }
+            }
+        }
+        edits
     }
 
     pub fn step(&mut self, forward: bool) -> Option<(usize, usize)> {
@@ -1042,7 +1206,7 @@ impl SearchState {
 }
 
 // ============================================================================
-// 6. Markdown / GFM 与多语言可见行语法高亮引擎（O(N) 有界前瞻）
+// 6. Markdown / GFM 与多语言可见行语法高亮引擎（O(N) + UTF-8 安全步进）
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1234,6 +1398,15 @@ fn is_keyword(lang: Lang, word: &str) -> bool {
     }
 }
 
+#[inline]
+fn next_char_step(line: &str, i: usize, limit: usize) -> usize {
+    if i >= limit {
+        return limit;
+    }
+    let ch_len = line[i..limit].chars().next().map(|c| c.len_utf8()).unwrap_or(1);
+    (i + ch_len).min(limit)
+}
+
 fn highlight_code_line(lang: Lang, line: &str, out: &mut Vec<(usize, usize, TokenKind)>) {
     if lang == Lang::Plain || line.is_empty() {
         return;
@@ -1274,14 +1447,14 @@ fn highlight_code_line(lang: Lang, line: &str, out: &mut Vec<(usize, usize, Toke
             i += 1;
             while i < len {
                 if bytes[i] == b'\\' && i + 1 < len {
-                    i += 2;
+                    i = next_char_step(line, i + 1, len);
                     continue;
                 }
                 if bytes[i] == quote {
                     i += 1;
                     break;
                 }
-                i += 1;
+                i = next_char_step(line, i, len);
             }
             out.push((start, i, TokenKind::StringLit));
             continue;
@@ -1290,7 +1463,7 @@ fn highlight_code_line(lang: Lang, line: &str, out: &mut Vec<(usize, usize, Toke
             let start = i;
             i += 1;
             while i < len && bytes[i] != b'>' && bytes[i] != b' ' {
-                i += 1;
+                i = next_char_step(line, i, len);
             }
             out.push((start, i, TokenKind::Keyword));
             continue;
@@ -1316,7 +1489,7 @@ fn highlight_code_line(lang: Lang, line: &str, out: &mut Vec<(usize, usize, Toke
             }
             continue;
         }
-        i += 1;
+        i = next_char_step(line, i, len);
     }
 }
 
@@ -1363,10 +1536,10 @@ fn scan_inline_md(
 
     while i < to {
         let b = bytes[i];
-        let look_end = clamp_str_boundary(line, (i + INLINE_LOOKAHEAD).min(to));
+        let look_end = floor_char_boundary(line, (i + INLINE_LOOKAHEAD).min(to));
 
         if b == b'\\' && i + 1 < to {
-            i += 2;
+            i = next_char_step(line, i + 1, to);
             continue;
         }
 
@@ -1389,7 +1562,7 @@ fn scan_inline_md(
                     }
                     j += c;
                 } else {
-                    j += 1;
+                    j = next_char_step(line, j, look_end);
                 }
             }
             if let Some(end) = found {
@@ -1482,7 +1655,7 @@ fn scan_inline_md(
                 let mut found = None;
                 while j < look_end {
                     if bytes[j] == b'\\' && j + 1 < look_end {
-                        j += 2;
+                        j = next_char_step(line, j + 1, look_end);
                         continue;
                     }
                     if bytes[j] == b && bytes[j - 1] != b' ' {
@@ -1491,7 +1664,7 @@ fn scan_inline_md(
                             break;
                         }
                     }
-                    j += 1;
+                    j = next_char_step(line, j, look_end);
                 }
                 if let Some(end) = found {
                     flush_plain(plain_start, i, out);
@@ -1503,10 +1676,7 @@ fn scan_inline_md(
             }
         }
 
-        i += 1;
-        while i < to && !line.is_char_boundary(i) {
-            i += 1;
-        }
+        i = next_char_step(line, i, to);
     }
     flush_plain(plain_start, to, out);
 }
