@@ -71,6 +71,9 @@ pub const IDM_VIEW_ZOOM_RESET: usize = 4012;
 pub const IDM_OUTLINE_EXPAND_ALL: usize = 4020;
 pub const IDM_OUTLINE_COLLAPSE_ALL: usize = 4021;
 pub const IDM_VIEW_OUTLINE_FLOAT: usize = 4022;
+pub const IDM_VIEW_FOLD_TOGGLE: usize = 4023;
+pub const IDM_VIEW_FOLD_ALL: usize = 4024;
+pub const IDM_VIEW_UNFOLD_ALL: usize = 4025;
 
 pub const IDM_EOL_CRLF: usize = 5201;
 pub const IDM_EOL_LF: usize = 5202;
@@ -286,10 +289,12 @@ unsafe extern "system" fn edit_box_subclass(hwnd: HWND, msg: u32, wp: usize, lp:
         }
         if wp == VK_RETURN as usize {
             let forward = !is_key_down(VK_SHIFT);
-            if let Some((ms, me)) = st.search.step(forward) {
-                st.doc.cursors = vec![Cursor { anchor: ms, head: me }];
-                st.ensure_caret_visible();
+            if st.search.matches.is_empty() && !st.search.query.is_empty() {
                 st.refresh_search_ui();
+            }
+            let sel = st.doc.primary().range();
+            if let Some((ms, me)) = st.search.step_from_caret(forward, sel) {
+                st.jump_to_search_match(ms, me);
             }
             return 0;
         }
@@ -354,10 +359,12 @@ unsafe extern "system" fn find_panel_proc(hwnd: HWND, msg: u32, wp: usize, lp: i
                         return 0;
                     }
                     IDC_BTN_NEXT | IDC_BTN_PREV => {
-                        if let Some((ms, me)) = st.search.step(id == IDC_BTN_NEXT) {
-                            st.doc.cursors = vec![Cursor { anchor: ms, head: me }];
-                            st.ensure_caret_visible();
+                        if st.search.matches.is_empty() && !st.search.query.is_empty() {
                             st.refresh_search_ui();
+                        }
+                        let sel = st.doc.primary().range();
+                        if let Some((ms, me)) = st.search.step_from_caret(id == IDC_BTN_NEXT, sel) {
+                            st.jump_to_search_match(ms, me);
                         }
                         return 0;
                     }
@@ -368,11 +375,10 @@ unsafe extern "system" fn find_panel_proc(hwnd: HWND, msg: u32, wp: usize, lp: i
                                 let rlen = rep.len();
                                 st.doc.apply_edits(vec![(ms, me, rep)], Some(vec![Cursor::collapsed(ms + rlen)]));
                                 st.after_doc_edited();
-                                if let Some((ns, ne)) = st.search.step(true) {
-                                    st.doc.cursors = vec![Cursor { anchor: ns, head: ne }];
-                                    st.ensure_caret_visible();
+                                let sel = st.doc.primary().range();
+                                if let Some((ns, ne)) = st.search.step_from_caret(true, sel) {
+                                    st.jump_to_search_match(ns, ne);
                                 }
-                                st.invalidate();
                             }
                         }
                         return 0;
@@ -509,9 +515,12 @@ unsafe extern "system" fn goto_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) 
                 let s = get_win_text(st.goto_edit);
                 if let Ok(line_num) = s.trim().parse::<usize>() {
                     let target = line_num.saturating_sub(1).min(st.doc.line_count().saturating_sub(1));
+                    if st.doc.ensure_line_unfolded(target) {
+                        st.reset_wraps_lazy();
+                    }
                     let pos = st.doc.line_col_to_byte(target, 0);
                     st.doc.cursors = vec![Cursor::collapsed(pos)];
-                    st.ensure_caret_visible();
+                    st.center_caret_in_view();
                     st.invalidate();
                 }
                 DestroyWindow(hwnd);
@@ -685,6 +694,10 @@ pub fn build_main_menu() -> (HMENU, HMENU) {
         add(m_view, IDM_VIEW_LINENUM, "显示行号(&L)\tCtrl+Shift+L");
         add(m_view, IDM_VIEW_WHITESPACE, "显示空白字符(&S)");
         AppendMenuW(m_view, MF_SEPARATOR, 0, null());
+        add(m_view, IDM_VIEW_FOLD_TOGGLE, "折叠 / 展开当前标题\tCtrl+M");
+        add(m_view, IDM_VIEW_FOLD_ALL, "全部折叠正文标题");
+        add(m_view, IDM_VIEW_UNFOLD_ALL, "全部展开正文标题");
+        AppendMenuW(m_view, MF_SEPARATOR, 0, null());
         add(m_view, IDM_VIEW_OUTLINE, "Markdown 大纲栏(&O)\tCtrl+Shift+O");
         add(m_view, IDM_VIEW_OUTLINE_FLOAT, "大纲栏浮动窗口(&P)");
         add(m_view, IDM_VIEW_OUTLINE_REFRESH, "刷新大纲目录(&E)");
@@ -817,7 +830,7 @@ fn main() {
             client_h: 720,
             line_h: 24,
             avg_char_w: 9,
-            gutter_w: 14,
+            gutter_w: 28,
             scroll_y: 0,
             scroll_x: 0,
             wrap_max_px_cached: 0,
