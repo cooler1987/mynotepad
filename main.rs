@@ -70,6 +70,7 @@ pub const IDM_VIEW_ZOOM_OUT: usize = 4011;
 pub const IDM_VIEW_ZOOM_RESET: usize = 4012;
 pub const IDM_OUTLINE_EXPAND_ALL: usize = 4020;
 pub const IDM_OUTLINE_COLLAPSE_ALL: usize = 4021;
+pub const IDM_VIEW_OUTLINE_FLOAT: usize = 4022;
 
 pub const IDM_EOL_CRLF: usize = 5201;
 pub const IDM_EOL_LF: usize = 5202;
@@ -363,35 +364,26 @@ unsafe extern "system" fn find_panel_proc(hwnd: HWND, msg: u32, wp: usize, lp: i
                     IDC_BTN_REPLACE => {
                         if let Some(idx) = st.search.current_idx {
                             if let Some(&(ms, me)) = st.search.matches.get(idx) {
-                                let rep = st.search.replace_with.clone();
+                                let rep = st.search.expand_single_replace(&st.doc, ms, me);
                                 let rlen = rep.len();
                                 st.doc.apply_edits(vec![(ms, me, rep)], Some(vec![Cursor::collapsed(ms + rlen)]));
-                                st.update_gutter_width();
-                                st.sync_wraps_after_edit();
-                                st.update_title();
-                                st.refresh_search_ui();
+                                st.after_doc_edited();
                                 if let Some((ns, ne)) = st.search.step(true) {
                                     st.doc.cursors = vec![Cursor { anchor: ns, head: ne }];
+                                    st.ensure_caret_visible();
                                 }
-                                st.ensure_caret_visible();
+                                st.invalidate();
                             }
                         }
                         return 0;
                     }
                     IDC_BTN_REPLACE_ALL => {
-                        if !st.search.matches.is_empty() {
-                            let rep = st.search.replace_with.clone();
-                            let edits: Vec<(usize, usize, String)> = st
-                                .search
-                                .matches
-                                .iter()
-                                .map(|&(s, e)| (s, e, rep.clone()))
-                                .collect();
+                        let edits = st.search.build_replace_all_edits(&st.doc.text);
+                        if !edits.is_empty() {
                             st.doc.apply_edits(edits, None);
-                            st.update_gutter_width();
-                            st.sync_wraps_after_edit();
-                            st.ensure_caret_visible();
-                            st.update_title();
+                            st.after_doc_edited();
+                            st.invalidate();
+                        } else {
                             st.refresh_search_ui();
                         }
                         return 0;
@@ -694,6 +686,7 @@ pub fn build_main_menu() -> (HMENU, HMENU) {
         add(m_view, IDM_VIEW_WHITESPACE, "显示空白字符(&S)");
         AppendMenuW(m_view, MF_SEPARATOR, 0, null());
         add(m_view, IDM_VIEW_OUTLINE, "Markdown 大纲栏(&O)\tCtrl+Shift+O");
+        add(m_view, IDM_VIEW_OUTLINE_FLOAT, "大纲栏浮动窗口(&P)");
         add(m_view, IDM_VIEW_OUTLINE_REFRESH, "刷新大纲目录(&E)");
         AppendMenuW(m_view, MF_SEPARATOR, 0, null());
         add(m_view, IDM_VIEW_THEME_DARK, "深色主题 (Dark)");
@@ -807,6 +800,7 @@ fn main() {
         let mut state = Box::new(AppState {
             hwnd,
             recent_menu,
+            outline_hwnd: null_mut(),
             hfont_regular: null_mut(),
             hfont_bold: null_mut(),
             hfont_italic: null_mut(),
@@ -866,6 +860,10 @@ fn main() {
         let show_cmd = if (*state_ptr).cfg.maximized { SW_SHOWMAXIMIZED } else { SW_SHOW };
         ShowWindow(hwnd, show_cmd);
         UpdateWindow(hwnd);
+        if (*state_ptr).cfg.outline_visible {
+            (*state_ptr).outline.refresh_from_doc(&(*state_ptr).doc);
+            (*state_ptr).sync_outline_window();
+        }
         log_msg("INFO", "Main window ready");
 
         let mut msg: MSG = std::mem::zeroed();
