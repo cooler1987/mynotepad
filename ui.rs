@@ -4,6 +4,7 @@ use std::ptr::{null, null_mut};
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::DataExchange::IsClipboardFormatAvailable;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::Controls::{EM_SETSEL, SetScrollInfo};
 use windows_sys::Win32::UI::Input::Ime::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
@@ -13,7 +14,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use crate::engine::*;
 use crate::render::{
     apply_titlebar_theme, compute_line_wraps_with_dc, expand_tabs_col, expand_tabs_with_u16_map,
-    get_theme, paint_editor, VisualSeg, OUTLINE_HEADER_H, OUTLINE_ROW_H, STATUS_BAR_HEIGHT,
+    get_theme, paint_editor, paint_floating_outline, VisualSeg, OUTLINE_HEADER_H, OUTLINE_ROW_H,
+    STATUS_BAR_HEIGHT,
 };
 use crate::{
     clipboard_copy, clipboard_paste, dialog_choose_font, dialog_open_file, dialog_save_file,
@@ -25,9 +27,9 @@ use crate::{
     IDM_FILE_RECENT_CLEAR, IDM_FILE_RELOAD, IDM_FILE_SAVE, IDM_FILE_SAVEAS,
     IDM_OUTLINE_COLLAPSE_ALL, IDM_OUTLINE_EXPAND_ALL, IDM_SEARCH_FIND, IDM_SEARCH_GOTO,
     IDM_SEARCH_NEXT, IDM_SEARCH_PREV, IDM_SEARCH_REPLACE, IDM_VIEW_FONT, IDM_VIEW_LINENUM,
-    IDM_VIEW_OUTLINE, IDM_VIEW_OUTLINE_REFRESH, IDM_VIEW_THEME_DARK, IDM_VIEW_THEME_LIGHT,
-    IDM_VIEW_TOPMOST, IDM_VIEW_WHITESPACE, IDM_VIEW_WRAP, IDM_VIEW_ZOOM_IN, IDM_VIEW_ZOOM_OUT,
-    IDM_VIEW_ZOOM_RESET,
+    IDM_VIEW_OUTLINE, IDM_VIEW_OUTLINE_FLOAT, IDM_VIEW_OUTLINE_REFRESH, IDM_VIEW_THEME_DARK,
+    IDM_VIEW_THEME_LIGHT, IDM_VIEW_TOPMOST, IDM_VIEW_WHITESPACE, IDM_VIEW_WRAP, IDM_VIEW_ZOOM_IN,
+    IDM_VIEW_ZOOM_OUT, IDM_VIEW_ZOOM_RESET,
 };
 
 #[inline]
@@ -50,6 +52,7 @@ fn key_down(vk: u16) -> bool {
 pub struct AppState {
     pub hwnd: HWND,
     pub recent_menu: HMENU,
+    pub outline_hwnd: HWND,
     pub hfont_regular: HFONT,
     pub hfont_bold: HFONT,
     pub hfont_italic: HFONT,
@@ -169,7 +172,7 @@ impl AppState {
     }
 
     fn outline_panel_width(&self) -> i32 {
-        if self.cfg.outline_visible && self.client_w > 460 {
+        if self.cfg.outline_visible && !self.cfg.outline_floating && self.client_w > 460 {
             self.cfg.outline_width.clamp(180, (self.client_w / 2).max(180))
         } else {
             0
@@ -383,6 +386,16 @@ impl AppState {
             self.reset_wraps_lazy();
         } else if min_dirty != usize::MAX {
             self.rebuild_visual_prefix_from(min_dirty);
+        }
+    }
+
+    pub fn after_doc_edited(&mut self) {
+        self.update_gutter_width();
+        self.sync_wraps_after_edit();
+        self.ensure_caret_visible();
+        self.update_title();
+        if self.search.visible {
+            self.refresh_search_ui();
         }
     }
 
@@ -605,6 +618,85 @@ impl AppState {
         }
     }
 
+    pub fn invalidate_outline(&self) {
+        unsafe {
+            if self.cfg.outline_floating && !self.outline_hwnd.is_null() {
+                InvalidateRect(self.outline_hwnd, null(), 0);
+            } else {
+                InvalidateRect(self.hwnd, null(), 0);
+            }
+        }
+    }
+
+    pub fn sync_outline_window(&mut self) {
+        unsafe {
+            if self.cfg.outline_visible && self.cfg.outline_floating {
+                if self.outline_hwnd.is_null() {
+                    let hinst = GetModuleHandleW(null());
+                    let cls = to_wide("NotepadLiteOutlineFloat");
+                    let wc = WNDCLASSEXW {
+                        cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                        style: CS_DBLCLKS,
+                        lpfnWndProc: Some(outline_wnd_proc),
+                        cbClsExtra: 0,
+                        cbWndExtra: 0,
+                        hInstance: hinst,
+                        hIcon: null_mut(),
+                        hCursor: LoadCursorW(null_mut(), IDC_ARROW),
+                        hbrBackground: null_mut(),
+                        lpszMenuName: null(),
+                        lpszClassName: cls.as_ptr(),
+                        hIconSm: null_mut(),
+                    };
+                    RegisterClassExW(&wc);
+
+                    let mut rc: RECT = std::mem::zeroed();
+                    GetWindowRect(self.hwnd, &mut rc);
+                    let fw = self.cfg.outline_float_w.clamp(200, 600);
+                    let fh = self.cfg.outline_float_h.clamp(220, 900);
+                    let (fx, fy) = if self.cfg.outline_x == CW_USEDEFAULT {
+                        ((rc.right - fw - 26).max(rc.left + 40), rc.top + 82)
+                    } else {
+                        (self.cfg.outline_x, self.cfg.outline_y)
+                    };
+                    let ex = WS_EX_TOOLWINDOW | if self.cfg.always_on_top { WS_EX_TOPMOST } else { 0 };
+                    let title = to_wide("Markdown 大纲");
+                    let ohwnd = CreateWindowExW(
+                        ex,
+                        cls.as_ptr(),
+                        title.as_ptr(),
+                        WS_POPUP | WS_BORDER | WS_CLIPCHILDREN,
+                        fx,
+                        fy,
+                        fw,
+                        fh,
+                        self.hwnd, // Owner 设为正文主窗：浮动时始终位于正文框上方
+                        null_mut(),
+                        hinst,
+                        null(),
+                    );
+                    if !ohwnd.is_null() {
+                        SetWindowLongPtrW(ohwnd, GWLP_USERDATA, self as *mut AppState as isize);
+                        self.outline_hwnd = ohwnd;
+                        ShowWindow(ohwnd, SW_SHOWNOACTIVATE);
+                    }
+                } else {
+                    ShowWindow(self.outline_hwnd, SW_SHOWNOACTIVATE);
+                    InvalidateRect(self.outline_hwnd, null(), 0);
+                }
+            } else if !self.outline_hwnd.is_null() {
+                DestroyWindow(self.outline_hwnd);
+                self.outline_hwnd = null_mut();
+            }
+        }
+        self.reset_wraps_lazy();
+        self.update_scrollbars();
+        if self.search.visible {
+            self.layout_find_panel();
+        }
+        self.invalidate();
+    }
+
     fn update_ime_pos(&mut self) {
         let head = self.doc.primary().head;
         let vrow = self.byte_to_visual_row(head);
@@ -702,6 +794,7 @@ impl AppState {
 
                 if self.cfg.outline_visible {
                     self.outline.refresh_from_doc(&self.doc);
+                    self.invalidate_outline();
                 } else {
                     self.outline.nodes.clear();
                 }
@@ -759,6 +852,7 @@ impl AppState {
                 }
                 if self.cfg.outline_visible {
                     self.outline.refresh_from_doc(&self.doc);
+                    self.invalidate_outline();
                 }
                 let pstr = path.to_string_lossy().to_string();
                 self.cfg.recent_files.retain(|r| r != &pstr);
@@ -813,6 +907,7 @@ fn sync_menu_checks(state: &AppState, hmenu: HMENU) {
     chk(IDM_VIEW_LINENUM, state.cfg.show_line_numbers);
     chk(IDM_VIEW_WHITESPACE, state.cfg.show_whitespace);
     chk(IDM_VIEW_OUTLINE, state.cfg.outline_visible);
+    chk(IDM_VIEW_OUTLINE_FLOAT, state.cfg.outline_floating);
     chk(IDM_VIEW_THEME_DARK, state.cfg.dark_theme);
     chk(IDM_VIEW_THEME_LIGHT, !state.cfg.dark_theme);
     chk(IDM_VIEW_TOPMOST, state.cfg.always_on_top);
@@ -865,7 +960,7 @@ fn show_editor_context_menu(state: &AppState, mx: i32, my: i32) {
     }
 }
 
-fn show_outline_context_menu(state: &AppState, mx: i32, my: i32) {
+fn show_outline_context_menu(state: &AppState, owner_hwnd: HWND, mx: i32, my: i32) {
     unsafe {
         let menu = CreatePopupMenu();
         let add = |id: usize, label: &str| {
@@ -876,18 +971,157 @@ fn show_outline_context_menu(state: &AppState, mx: i32, my: i32) {
         add(IDM_OUTLINE_EXPAND_ALL, "全部展开(&E)");
         add(IDM_OUTLINE_COLLAPSE_ALL, "全部折叠(&C)");
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        add(
+            IDM_VIEW_OUTLINE_FLOAT,
+            if state.cfg.outline_floating { "停靠到正文右侧(&D)" } else { "分离为浮动窗口(&F)" },
+        );
         add(IDM_VIEW_OUTLINE, "关闭大纲栏(&X)");
 
         let mut pt = POINT { x: mx, y: my };
-        ClientToScreen(state.hwnd, &mut pt);
+        ClientToScreen(owner_hwnd, &mut pt);
         TrackPopupMenu(menu, TPM_RIGHTBUTTON, pt.x, pt.y, 0, state.hwnd, null());
         DestroyMenu(menu);
     }
 }
 
 // ============================================================================
-// 命令分发、大纲交互与快捷键处理
+// 大纲交互、浮动大纲窗口过程与指令分发
 // ============================================================================
+
+fn handle_outline_click(state: &mut AppState, x: i32, y: i32, left: i32, right: i32) {
+    if y < OUTLINE_HEADER_H {
+        if y >= 4 && y <= OUTLINE_HEADER_H - 4 {
+            if x >= right - 134 && x <= right - 95 {
+                state.outline.refresh_from_doc(&state.doc);
+                state.invalidate_outline();
+            } else if x >= right - 92 && x <= right - 72 {
+                state.outline.set_all_collapsed(false);
+                state.invalidate_outline();
+            } else if x >= right - 69 && x <= right - 49 {
+                state.outline.set_all_collapsed(true);
+                state.invalidate_outline();
+            } else if x >= right - 46 && x <= right - 25 {
+                handle_command(state, IDM_VIEW_OUTLINE_FLOAT);
+            } else if x >= right - 22 && x <= right - 4 {
+                handle_command(state, IDM_VIEW_OUTLINE);
+            }
+        }
+        return;
+    }
+
+    let vis = state.outline.visible_indices();
+    let row = state.outline.scroll_row + ((y - OUTLINE_HEADER_H) / OUTLINE_ROW_H) as usize;
+    if row >= vis.len() {
+        return;
+    }
+    let node_idx = vis[row];
+    let node = state.outline.nodes[node_idx].clone();
+    let indent = 10 + (node.level.saturating_sub(1) as i32) * 14;
+    if node.has_children && x >= left + indent - 4 && x <= left + indent + 16 {
+        state.outline.toggle_collapse(node_idx);
+        state.invalidate_outline();
+        return;
+    }
+
+    state.outline.selected_idx = Some(node_idx);
+    state.doc.cursors = vec![Cursor::collapsed(node.byte_pos)];
+    let target_vrow = state.byte_to_visual_row(node.byte_pos);
+    let max_y = state.total_visual_lines().saturating_sub(1);
+    state.scroll_y = target_vrow.saturating_sub(2).min(max_y);
+    state.update_scrollbars();
+    unsafe {
+        SetFocus(state.hwnd);
+    }
+    state.invalidate();
+    state.invalidate_outline();
+}
+
+unsafe extern "system" fn outline_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp: isize) -> isize {
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppState;
+    if ptr.is_null() {
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    let st = &mut *ptr;
+
+    match msg {
+        WM_ERASEBKGND => 1,
+        WM_PAINT => {
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            let mut ps: PAINTSTRUCT = std::mem::zeroed();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            paint_floating_outline(st, hdc, rc.right - rc.left, rc.bottom - rc.top);
+            EndPaint(hwnd, &ps);
+            0
+        }
+        WM_NCHITTEST => {
+            let mut pt = POINT { x: get_x_lparam(lp), y: get_y_lparam(lp) };
+            ScreenToClient(hwnd, &mut pt);
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            let b = 5;
+            let on_l = pt.x < b;
+            let on_r = pt.x >= rc.right - b;
+            let on_t = pt.y < b;
+            let on_bot = pt.y >= rc.bottom - b;
+            if on_t && on_l { return HTTOPLEFT as isize; }
+            if on_t && on_r { return HTTOPRIGHT as isize; }
+            if on_bot && on_l { return HTBOTTOMLEFT as isize; }
+            if on_bot && on_r { return HTBOTTOMRIGHT as isize; }
+            if on_l { return HTLEFT as isize; }
+            if on_r { return HTRIGHT as isize; }
+            if on_t { return HTTOP as isize; }
+            if on_bot { return HTBOTTOM as isize; }
+            if pt.y < OUTLINE_HEADER_H && pt.x < rc.right - 138 {
+                return HTCAPTION as isize;
+            }
+            HTCLIENT as isize
+        }
+        WM_LBUTTONDOWN => {
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            handle_outline_click(st, get_x_lparam(lp), get_y_lparam(lp), 0, rc.right);
+            0
+        }
+        WM_RBUTTONUP => {
+            show_outline_context_menu(st, hwnd, get_x_lparam(lp), get_y_lparam(lp));
+            0
+        }
+        WM_MOUSEWHEEL => {
+            let delta = ((wp >> 16) as i16) as i32;
+            let mut rc: RECT = std::mem::zeroed();
+            GetClientRect(hwnd, &mut rc);
+            let vis_len = st.outline.visible_indices().len();
+            let page_rows = ((rc.bottom - OUTLINE_HEADER_H) / OUTLINE_ROW_H).max(1) as usize;
+            let max_row = vis_len.saturating_sub(page_rows);
+            let step = if delta > 0 { -2isize } else { 2isize };
+            st.outline.scroll_row = (st.outline.scroll_row as isize + step).clamp(0, max_row as isize) as usize;
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_EXITSIZEMOVE => {
+            let mut rc: RECT = std::mem::zeroed();
+            GetWindowRect(hwnd, &mut rc);
+            st.cfg.outline_x = rc.left;
+            st.cfg.outline_y = rc.top;
+            st.cfg.outline_float_w = (rc.right - rc.left).max(200);
+            st.cfg.outline_float_h = (rc.bottom - rc.top).max(220);
+            save_config(&st.cfg);
+            0
+        }
+        WM_SIZE => {
+            InvalidateRect(hwnd, null(), 0);
+            0
+        }
+        WM_CLOSE => {
+            st.cfg.outline_visible = false;
+            save_config(&st.cfg);
+            st.sync_outline_window();
+            0
+        }
+        _ => DefWindowProcW(hwnd, msg, wp, lp),
+    }
+}
 
 fn apply_theme_choice(state: &mut AppState, dark: bool) {
     state.cfg.dark_theme = dark;
@@ -899,6 +1133,7 @@ fn apply_theme_choice(state: &mut AppState, dark: bool) {
             InvalidateRect(state.find_panel, null(), 1);
         }
     }
+    state.invalidate_outline();
     state.invalidate();
 }
 
@@ -914,8 +1149,12 @@ pub fn handle_command(state: &mut AppState, id: usize) {
                 state.update_scrollbars();
                 if state.cfg.outline_visible {
                     state.outline.refresh_from_doc(&state.doc);
+                    state.invalidate_outline();
                 } else {
                     state.outline.nodes.clear();
+                }
+                if state.search.visible {
+                    state.refresh_search_ui();
                 }
                 state.update_title();
                 state.invalidate();
@@ -941,7 +1180,7 @@ pub fn handle_command(state: &mut AppState, id: usize) {
                 }
             } else if state.cfg.outline_visible {
                 state.outline.refresh_from_doc(&state.doc);
-                state.invalidate();
+                state.invalidate_outline();
             }
         }
         IDM_FILE_RECENT_BASE..=1109 => {
@@ -969,19 +1208,13 @@ pub fn handle_command(state: &mut AppState, id: usize) {
 
         IDM_EDIT_UNDO => {
             if state.doc.undo() {
-                state.update_gutter_width();
-                state.sync_wraps_after_edit();
-                state.ensure_caret_visible();
-                state.update_title();
+                state.after_doc_edited();
                 state.invalidate();
             }
         }
         IDM_EDIT_REDO => {
             if state.doc.redo() {
-                state.update_gutter_width();
-                state.sync_wraps_after_edit();
-                state.ensure_caret_visible();
-                state.update_title();
+                state.after_doc_edited();
                 state.invalidate();
             }
         }
@@ -1003,28 +1236,19 @@ pub fn handle_command(state: &mut AppState, id: usize) {
                 clipboard_copy(state.hwnd, state.doc.line_str(l));
                 state.doc.delete_current_line();
             }
-            state.update_gutter_width();
-            state.sync_wraps_after_edit();
-            state.ensure_caret_visible();
-            state.update_title();
+            state.after_doc_edited();
             state.invalidate();
         }
         IDM_EDIT_PASTE => {
             if let Some(txt) = clipboard_paste(state.hwnd) {
                 state.doc.insert_text(&txt);
-                state.update_gutter_width();
-                state.sync_wraps_after_edit();
-                state.ensure_caret_visible();
-                state.update_title();
+                state.after_doc_edited();
                 state.invalidate();
             }
         }
         IDM_EDIT_DELETE => {
             state.doc.delete_forward();
-            state.update_gutter_width();
-            state.sync_wraps_after_edit();
-            state.ensure_caret_visible();
-            state.update_title();
+            state.after_doc_edited();
             state.invalidate();
         }
         IDM_EDIT_SELECT_ALL => {
@@ -1033,45 +1257,32 @@ pub fn handle_command(state: &mut AppState, id: usize) {
         }
         IDM_EDIT_DUP_LINE => {
             state.doc.duplicate_current_line();
-            state.update_gutter_width();
-            state.sync_wraps_after_edit();
-            state.ensure_caret_visible();
-            state.update_title();
+            state.after_doc_edited();
             state.invalidate();
         }
         IDM_EDIT_DEL_LINE => {
             state.doc.delete_current_line();
-            state.update_gutter_width();
-            state.sync_wraps_after_edit();
-            state.ensure_caret_visible();
-            state.update_title();
+            state.after_doc_edited();
             state.invalidate();
         }
         IDM_EDIT_MOVE_UP => {
             state.doc.move_lines(true);
-            state.sync_wraps_after_edit();
-            state.ensure_caret_visible();
-            state.update_title();
+            state.after_doc_edited();
             state.invalidate();
         }
         IDM_EDIT_MOVE_DOWN => {
             state.doc.move_lines(false);
-            state.sync_wraps_after_edit();
-            state.ensure_caret_visible();
-            state.update_title();
+            state.after_doc_edited();
             state.invalidate();
         }
         IDM_EDIT_COMMENT => {
             state.doc.toggle_comment(state.doc.lang);
-            state.sync_wraps_after_edit();
-            state.ensure_caret_visible();
-            state.update_title();
+            state.after_doc_edited();
             state.invalidate();
         }
         IDM_EDIT_UPPER | IDM_EDIT_LOWER => {
             state.doc.transform_case(id == IDM_EDIT_UPPER);
-            state.sync_wraps_after_edit();
-            state.update_title();
+            state.after_doc_edited();
             state.invalidate();
         }
 
@@ -1119,34 +1330,34 @@ pub fn handle_command(state: &mut AppState, id: usize) {
             if state.cfg.outline_visible {
                 state.outline.refresh_from_doc(&state.doc);
             }
-            state.reset_wraps_lazy();
-            state.update_scrollbars();
-            if state.search.visible {
-                state.layout_find_panel();
+            save_config(&state.cfg);
+            state.sync_outline_window();
+        }
+        IDM_VIEW_OUTLINE_FLOAT => {
+            state.cfg.outline_floating = !state.cfg.outline_floating;
+            if !state.cfg.outline_visible {
+                state.cfg.outline_visible = true;
+                state.outline.refresh_from_doc(&state.doc);
             }
             save_config(&state.cfg);
-            state.invalidate();
+            state.sync_outline_window();
         }
         IDM_VIEW_OUTLINE_REFRESH => {
             if !state.cfg.outline_visible {
                 state.cfg.outline_visible = true;
-                state.reset_wraps_lazy();
-                state.update_scrollbars();
-                if state.search.visible {
-                    state.layout_find_panel();
-                }
                 save_config(&state.cfg);
+                state.sync_outline_window();
             }
             state.outline.refresh_from_doc(&state.doc);
-            state.invalidate();
+            state.invalidate_outline();
         }
         IDM_OUTLINE_EXPAND_ALL => {
             state.outline.set_all_collapsed(false);
-            state.invalidate();
+            state.invalidate_outline();
         }
         IDM_OUTLINE_COLLAPSE_ALL => {
             state.outline.set_all_collapsed(true);
-            state.invalidate();
+            state.invalidate_outline();
         }
         IDM_VIEW_FONT => dialog_choose_font(state),
         IDM_VIEW_THEME_DARK => apply_theme_choice(state, true),
@@ -1156,6 +1367,9 @@ pub fn handle_command(state: &mut AppState, id: usize) {
             let insert_after = if state.cfg.always_on_top { HWND_TOPMOST } else { HWND_NOTOPMOST };
             unsafe {
                 SetWindowPos(state.hwnd, insert_after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+                if !state.outline_hwnd.is_null() {
+                    SetWindowPos(state.outline_hwnd, insert_after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                }
             }
             save_config(&state.cfg);
         }
@@ -1195,51 +1409,6 @@ pub fn handle_command(state: &mut AppState, id: usize) {
         }
         _ => {}
     }
-}
-
-fn handle_outline_click(state: &mut AppState, x: i32, y: i32) {
-    let left = state.editor_right();
-    let right = state.client_w;
-    if y < OUTLINE_HEADER_H {
-        if x >= right - 112 && x <= right - 76 && y >= 4 && y <= OUTLINE_HEADER_H - 4 {
-            state.outline.refresh_from_doc(&state.doc);
-            state.invalidate();
-        } else if x >= right - 72 && x <= right - 42 && y >= 4 && y <= OUTLINE_HEADER_H - 4 {
-            state.outline.set_all_collapsed(false);
-            state.invalidate();
-        } else if x >= right - 38 && x <= right - 22 && y >= 4 && y <= OUTLINE_HEADER_H - 4 {
-            state.outline.set_all_collapsed(true);
-            state.invalidate();
-        } else if x >= right - 18 && x <= right - 4 && y >= 4 && y <= OUTLINE_HEADER_H - 4 {
-            handle_command(state, IDM_VIEW_OUTLINE);
-        }
-        return;
-    }
-
-    let vis = state.outline.visible_indices();
-    let row = state.outline.scroll_row + ((y - OUTLINE_HEADER_H) / OUTLINE_ROW_H) as usize;
-    if row >= vis.len() {
-        return;
-    }
-    let node_idx = vis[row];
-    let node = state.outline.nodes[node_idx].clone();
-    let indent = 10 + (node.level.saturating_sub(1) as i32) * 14;
-    if node.has_children && x >= left + indent - 4 && x <= left + indent + 16 {
-        state.outline.toggle_collapse(node_idx);
-        state.invalidate();
-        return;
-    }
-
-    state.outline.selected_idx = Some(node_idx);
-    state.doc.cursors = vec![Cursor::collapsed(node.byte_pos)];
-    let target_vrow = state.byte_to_visual_row(node.byte_pos);
-    let max_y = state.total_visual_lines().saturating_sub(1);
-    state.scroll_y = target_vrow.saturating_sub(2).min(max_y);
-    state.update_scrollbars();
-    unsafe {
-        SetFocus(state.hwnd);
-    }
-    state.invalidate();
 }
 
 fn handle_keydown(state: &mut AppState, vk: u16) -> bool {
@@ -1421,10 +1590,7 @@ fn handle_keydown(state: &mut AppState, vk: u16) -> bool {
         }
         VK_BACK => {
             state.doc.backspace();
-            state.update_gutter_width();
-            state.sync_wraps_after_edit();
-            state.ensure_caret_visible();
-            state.update_title();
+            state.after_doc_edited();
             state.invalidate();
             true
         }
@@ -1477,7 +1643,8 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
                 GetCursorPos(&mut pt);
                 ScreenToClient(hwnd, &mut pt);
                 let edit_r = st.editor_right();
-                if st.cfg.outline_visible && pt.y < st.client_h - STATUS_BAR_HEIGHT && (pt.x - edit_r).abs() <= 4 {
+                let docked_outline = st.cfg.outline_visible && !st.cfg.outline_floating;
+                if docked_outline && pt.y < st.client_h - STATUS_BAR_HEIGHT && (pt.x - edit_r).abs() <= 4 {
                     SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
                 } else if pt.x >= st.gutter_w && pt.x < edit_r && pt.y < st.client_h - STATUS_BAR_HEIGHT {
                     SetCursor(LoadCursorW(null_mut(), IDC_IBEAM));
@@ -1529,10 +1696,7 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
             } else {
                 return 0;
             }
-            st.update_gutter_width();
-            st.sync_wraps_after_edit();
-            st.ensure_caret_visible();
-            st.update_title();
+            st.after_doc_edited();
             st.invalidate();
             0
         }
@@ -1544,13 +1708,14 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
             let mx = get_x_lparam(lp);
             let my = get_y_lparam(lp);
             let edit_r = st.editor_right();
-            if st.cfg.outline_visible && my < st.client_h - STATUS_BAR_HEIGHT && (mx - edit_r).abs() <= 4 {
+            let docked_outline = st.cfg.outline_visible && !st.cfg.outline_floating;
+            if docked_outline && my < st.client_h - STATUS_BAR_HEIGHT && (mx - edit_r).abs() <= 4 {
                 SetCapture(hwnd);
                 st.resizing_outline = true;
                 return 0;
             }
-            if st.cfg.outline_visible && mx >= edit_r && my < st.client_h - STATUS_BAR_HEIGHT {
-                handle_outline_click(st, mx, my);
+            if docked_outline && mx >= edit_r && my < st.client_h - STATUS_BAR_HEIGHT {
+                handle_outline_click(st, mx, my, edit_r, st.client_w);
                 return 0;
             }
 
@@ -1633,8 +1798,8 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
                 return 0;
             }
             SetFocus(hwnd);
-            if st.cfg.outline_visible && mx >= st.editor_right() {
-                show_outline_context_menu(st, mx, my);
+            if st.cfg.outline_visible && !st.cfg.outline_floating && mx >= st.editor_right() {
+                show_outline_context_menu(st, hwnd, mx, my);
             } else {
                 let (pos, _, _) = st.hit_test(mx, my);
                 let in_sel = st.doc.cursors.iter().any(|c| {
@@ -1665,7 +1830,7 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
             let delta = ((wp >> 16) as i16) as i32;
             let mut pt = POINT { x: get_x_lparam(lp), y: get_y_lparam(lp) };
             ScreenToClient(hwnd, &mut pt);
-            if st.cfg.outline_visible && pt.x >= st.editor_right() && pt.y < st.client_h - STATUS_BAR_HEIGHT {
+            if st.cfg.outline_visible && !st.cfg.outline_floating && pt.x >= st.editor_right() && pt.y < st.client_h - STATUS_BAR_HEIGHT {
                 let vis_len = st.outline.visible_indices().len();
                 let page_rows = ((st.client_h - STATUS_BAR_HEIGHT - OUTLINE_HEADER_H) / OUTLINE_ROW_H).max(1) as usize;
                 let max_row = vis_len.saturating_sub(page_rows);
@@ -1740,6 +1905,16 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
         WM_CLOSE => {
             if !st.confirm_discard() {
                 return 0;
+            }
+            if !st.outline_hwnd.is_null() {
+                let mut orc: RECT = std::mem::zeroed();
+                GetWindowRect(st.outline_hwnd, &mut orc);
+                st.cfg.outline_x = orc.left;
+                st.cfg.outline_y = orc.top;
+                st.cfg.outline_float_w = (orc.right - orc.left).max(200);
+                st.cfg.outline_float_h = (orc.bottom - orc.top).max(220);
+                DestroyWindow(st.outline_hwnd);
+                st.outline_hwnd = null_mut();
             }
             let mut wp_info: WINDOWPLACEMENT = std::mem::zeroed();
             wp_info.length = std::mem::size_of::<WINDOWPLACEMENT>() as u32;
