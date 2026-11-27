@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, CW_USEDEFAULT, MB_ICONERROR, MB_OK};
 
-pub const LARGE_FILE_BYTES: usize = 20 * 1024 * 1024; // >20MB 触发大文件高亮降级策略
+pub const LARGE_FILE_BYTES: usize = 20 * 1024 * 1024;
 pub const MAX_MATCH_HIGHLIGHTS: usize = 50_000;
 const CURRENT_CONFIG_VERSION: u32 = 2;
 const INLINE_LOOKAHEAD: usize = 512;
@@ -136,10 +136,10 @@ impl Default for AppConfig {
             win_w: 1120,
             win_h: 740,
             maximized: false,
-            font_name: "Consolas".to_string(),
+            font_name: "Microsoft YaHei UI".to_string(),
             font_size: 16,
             zoom_pct: 100,
-            dark_theme: true,
+            dark_theme: false,
             word_wrap: true,
             show_line_numbers: false,
             show_whitespace: false,
@@ -202,7 +202,7 @@ pub fn save_config(cfg: &AppConfig) {
 }
 
 // ============================================================================
-// 3. 字符编码自动识别与读写（打开时自动识别，无手动转码）
+// 3. 字符编码自动识别与读写
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -376,7 +376,7 @@ pub fn save_file_with_encoding(
 }
 
 // ============================================================================
-// 4. 高性能文本缓冲、增量行索引、多行语法状态与撤销重做引擎
+// 4. 高性能文本缓冲、正文标题级别折叠、多行语法状态与撤销重做引擎
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -415,10 +415,33 @@ struct UndoEntry {
     cursors_after: Vec<Cursor>,
 }
 
+fn detect_heading_level(line: &str, state: LineState) -> u8 {
+    if !matches!(state, LineState::Normal) {
+        return 0;
+    }
+    let trimmed = line.trim_start();
+    let ws = line.len() - trimmed.len();
+    if ws <= 3 && trimmed.starts_with('#') {
+        let mut h = 0usize;
+        while h < trimmed.len() && trimmed.as_bytes()[h] == b'#' {
+            h += 1;
+        }
+        if (1..=6).contains(&h)
+            && (h == trimmed.len() || trimmed.as_bytes()[h] == b' ' || trimmed.as_bytes()[h] == b'\t')
+        {
+            return h as u8;
+        }
+    }
+    0
+}
+
 pub struct Document {
     pub text: String,
     pub line_starts: Vec<usize>,
     pub line_states: Vec<LineState>,
+    pub line_levels: Vec<u8>,   // 0=正文, 1..=6=MD标题级别
+    pub line_folded: Vec<bool>, // 某标题行是否处于折叠状态
+    pub line_hidden: Vec<bool>, // 因上级折叠而被隐藏的行
     pub wrap_patches: Vec<(usize, usize, usize)>,
     pub cursors: Vec<Cursor>,
     undo_stack: VecDeque<UndoEntry>,
@@ -439,6 +462,9 @@ impl Document {
             text: String::new(),
             line_starts: vec![0],
             line_states: vec![LineState::Normal],
+            line_levels: vec![0],
+            line_folded: vec![false],
+            line_hidden: vec![false],
             wrap_patches: Vec::new(),
             cursors: vec![Cursor::collapsed(0)],
             undo_stack: VecDeque::new(),
@@ -479,6 +505,11 @@ impl Document {
         } else {
             self.text.chars().count()
         };
+        let count = self.line_starts.len();
+        self.line_folded.clear();
+        self.line_folded.resize(count, false);
+        self.line_hidden.clear();
+        self.line_hidden.resize(count, false);
         self.rebuild_all_line_states();
     }
 
@@ -486,18 +517,22 @@ impl Document {
         let count = self.line_starts.len();
         self.line_states.clear();
         self.line_states.resize(count, LineState::Normal);
-        if self.large_mode || self.lang != Lang::Markdown {
+        self.line_levels.clear();
+        self.line_levels.resize(count, 0);
+        if self.lang != Lang::Markdown {
             return;
         }
         let mut st = LineState::Normal;
         for l in 0..count {
             self.line_states[l] = st;
-            st = advance_md_line_state(st, self.line_str(l));
+            let line = self.line_str(l);
+            self.line_levels[l] = detect_heading_level(line, st);
+            st = advance_md_line_state(st, line);
         }
     }
 
     fn update_line_states_incremental(&mut self, start_line: usize, dirty_end_line: usize) {
-        if self.large_mode || self.lang != Lang::Markdown {
+        if self.lang != Lang::Markdown {
             return;
         }
         let count = self.line_starts.len();
@@ -507,10 +542,112 @@ impl Document {
         let mut st = self.line_states[start_line];
         for l in start_line..count {
             self.line_states[l] = st;
-            st = advance_md_line_state(st, self.line_str(l));
+            let line = self.line_str(l);
+            self.line_levels[l] = detect_heading_level(line, st);
+            st = advance_md_line_state(st, line);
             if l + 1 < count && l >= dirty_end_line && self.line_states[l + 1] == st {
                 break;
             }
+        }
+    }
+
+    pub fn recompute_hidden_lines(&mut self) {
+        let count = self.line_starts.len();
+        if self.line_hidden.len() != count {
+            self.line_hidden.resize(count, false);
+        }
+        let mut fold_level: Option<u8> = None;
+        for l in 0..count {
+            let lvl = self.line_levels.get(l).copied().unwrap_or(0);
+            if let Some(fl) = fold_level {
+                if lvl > 0 && lvl <= fl {
+                    fold_level = None;
+                } else {
+                    self.line_hidden[l] = true;
+                    continue;
+                }
+            }
+            self.line_hidden[l] = false;
+            if lvl > 0 && self.line_folded.get(l).copied().unwrap_or(false) {
+                fold_level = Some(lvl);
+            }
+        }
+    }
+
+    pub fn toggle_fold_at_line(&mut self, line: usize) -> bool {
+        if line >= self.line_folded.len() || self.line_levels.get(line).copied().unwrap_or(0) == 0 {
+            return false;
+        }
+        self.line_folded[line] = !self.line_folded[line];
+        self.recompute_hidden_lines();
+        true
+    }
+
+    pub fn set_all_folds(&mut self, folded: bool) {
+        for l in 0..self.line_folded.len() {
+            if self.line_levels.get(l).copied().unwrap_or(0) > 0 {
+                self.line_folded[l] = folded;
+            } else {
+                self.line_folded[l] = false;
+            }
+        }
+        self.recompute_hidden_lines();
+    }
+
+    pub fn ensure_line_unfolded(&mut self, target_line: usize) -> bool {
+        if target_line >= self.line_hidden.len() || !self.line_hidden[target_line] {
+            return false;
+        }
+        let mut changed = false;
+        let mut min_lvl = u8::MAX;
+        for l in (0..target_line).rev() {
+            let lvl = self.line_levels[l];
+            if lvl > 0 && lvl < min_lvl {
+                if self.line_folded[l] {
+                    self.line_folded[l] = false;
+                    changed = true;
+                }
+                min_lvl = lvl;
+                if min_lvl == 1 {
+                    break;
+                }
+            }
+        }
+        if changed {
+            self.recompute_hidden_lines();
+        }
+        changed
+    }
+
+    pub fn folded_descendant_count(&self, line: usize) -> usize {
+        if !self.line_folded.get(line).copied().unwrap_or(false) {
+            return 0;
+        }
+        let fl = self.line_levels.get(line).copied().unwrap_or(0);
+        if fl == 0 {
+            return 0;
+        }
+        let mut cnt = 0usize;
+        for l in (line + 1)..self.line_count() {
+            let lvl = self.line_levels[l];
+            if lvl > 0 && lvl <= fl {
+                break;
+            }
+            cnt += 1;
+        }
+        cnt
+    }
+
+    pub fn heading_for_line(&self, line: usize) -> Option<usize> {
+        let mut l = line.min(self.line_count().saturating_sub(1));
+        loop {
+            if self.line_levels.get(l).copied().unwrap_or(0) > 0 {
+                return Some(l);
+            }
+            if l == 0 {
+                return None;
+            }
+            l -= 1;
         }
     }
 
@@ -678,10 +815,16 @@ impl Document {
 
         let old_span = end_line - start_line + 1;
         let new_span = added_count + 1;
-        let fill_states = vec![LineState::Normal; added_count];
-        self.line_states.splice((start_line + 1)..=end_line, fill_states);
+        self.line_states.splice((start_line + 1)..=end_line, vec![LineState::Normal; added_count]);
+        self.line_levels.splice((start_line + 1)..=end_line, vec![0; added_count]);
+        self.line_folded.splice((start_line + 1)..=end_line, vec![false; added_count]);
+        self.line_hidden.splice((start_line + 1)..=end_line, vec![false; added_count]);
+
         self.large_mode = self.text.len() > LARGE_FILE_BYTES;
         self.update_line_states_incremental(start_line, start_line + added_count);
+        if self.line_folded.iter().any(|&f| f) {
+            self.recompute_hidden_lines();
+        }
         self.wrap_patches.push((start_line, old_span, new_span));
     }
 
@@ -1185,20 +1328,25 @@ impl SearchState {
         edits
     }
 
-    pub fn step(&mut self, forward: bool) -> Option<(usize, usize)> {
+    pub fn step_from_caret(&mut self, forward: bool, caret_sel: (usize, usize)) -> Option<(usize, usize)> {
         if self.matches.is_empty() {
             return None;
         }
         let len = self.matches.len();
-        let next = match self.current_idx {
-            Some(i) => {
-                if forward {
-                    (i + 1) % len
-                } else {
-                    (i + len - 1) % len
-                }
+        let next = if let Some(cur) = self.current_idx {
+            if self.matches[cur] == caret_sel {
+                if forward { (cur + 1) % len } else { (cur + len - 1) % len }
+            } else if forward {
+                self.matches.partition_point(|&(s, _)| s < caret_sel.1) % len
+            } else {
+                let p = self.matches.partition_point(|&(s, _)| s < caret_sel.0);
+                if p == 0 { len - 1 } else { p - 1 }
             }
-            None => 0,
+        } else if forward {
+            self.matches.partition_point(|&(s, _)| s < caret_sel.1) % len
+        } else {
+            let p = self.matches.partition_point(|&(s, _)| s < caret_sel.0);
+            if p == 0 { len - 1 } else { p - 1 }
         };
         self.current_idx = Some(next);
         Some(self.matches[next])
@@ -1237,6 +1385,7 @@ pub enum TokenKind {
     Keyword,
     Heading1,
     Heading2,
+    Heading3,
     StringLit,
     Comment,
     Number,
@@ -1744,8 +1893,12 @@ pub fn highlight_line_with_state(
             hashes += 1;
         }
         if (1..=6).contains(&hashes) && (hashes == rest.len() || rest.as_bytes()[hashes] == b' ' || rest.as_bytes()[hashes] == b'\t') {
-            let h_kind = if hashes <= 2 { TokenKind::Heading1 } else { TokenKind::Heading2 };
-            out.push((ws, ws + hashes, TokenKind::Accent));
+            let h_kind = match hashes {
+                1 => TokenKind::Heading1,
+                2 => TokenKind::Heading2,
+                _ => TokenKind::Heading3,
+            };
+            out.push((ws, ws + hashes, h_kind));
             if ws + hashes < len {
                 out.push((ws + hashes, len, h_kind));
             }
