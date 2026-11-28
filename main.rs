@@ -78,6 +78,56 @@ pub const IDM_VIEW_UNFOLD_ALL: usize = 4025;
 pub const IDM_EOL_CRLF: usize = 5201;
 pub const IDM_EOL_LF: usize = 5202;
 
+// Markdown 段落转换命令 ID
+pub const IDM_MD_BLK_PARA: usize = 7001;
+pub const IDM_MD_BLK_H1: usize = 7002;
+pub const IDM_MD_BLK_H2: usize = 7003;
+pub const IDM_MD_BLK_H3: usize = 7004;
+pub const IDM_MD_BLK_H4: usize = 7005;
+pub const IDM_MD_BLK_H5: usize = 7006;
+pub const IDM_MD_BLK_BULLET: usize = 7007;
+pub const IDM_MD_BLK_ORDERED: usize = 7008;
+pub const IDM_MD_BLK_TASK: usize = 7009;
+pub const IDM_MD_BLK_QUOTE: usize = 7010;
+pub const IDM_MD_BLK_CODE: usize = 7011;
+pub const IDM_MD_INDENT: usize = 7012;
+pub const IDM_MD_OUTDENT: usize = 7013;
+
+// Markdown 行内格式命令 ID
+pub const IDM_MD_FMT_BOLD: usize = 7101;
+pub const IDM_MD_FMT_ITALIC: usize = 7102;
+pub const IDM_MD_FMT_CODE: usize = 7103;
+pub const IDM_MD_FMT_STRIKE: usize = 7104;
+pub const IDM_MD_FMT_LINK: usize = 7105;
+
+// Markdown 插入模板命令 ID
+pub const IDM_MD_INS_H1: usize = 7201;
+pub const IDM_MD_INS_H2: usize = 7202;
+pub const IDM_MD_INS_H3: usize = 7203;
+pub const IDM_MD_INS_H4: usize = 7204;
+pub const IDM_MD_INS_H5: usize = 7205;
+pub const IDM_MD_INS_BULLET: usize = 7206;
+pub const IDM_MD_INS_ORDERED: usize = 7207;
+pub const IDM_MD_INS_TASK: usize = 7208;
+pub const IDM_MD_INS_QUOTE: usize = 7209;
+pub const IDM_MD_INS_CODE: usize = 7210;
+pub const IDM_MD_INS_HR: usize = 7211;
+pub const IDM_MD_INS_TABLE: usize = 7212;
+pub const IDM_MD_INS_NOTE: usize = 7213;
+pub const IDM_MD_INS_TIP: usize = 7214;
+pub const IDM_MD_INS_IMPORTANT: usize = 7215;
+pub const IDM_MD_INS_WARNING: usize = 7216;
+pub const IDM_MD_INS_CAUTION: usize = 7217;
+pub const IDM_MD_INS_LINK: usize = 7218;
+pub const IDM_MD_INS_FORMULA: usize = 7219;
+pub const IDM_MD_INS_IMAGE: usize = 7220;
+
+// 代码块专项操作命令 ID
+pub const IDM_MD_CB_COPY_INNER: usize = 7301;
+pub const IDM_MD_CB_COPY_FULL: usize = 7302;
+pub const IDM_MD_CB_DELETE: usize = 7303;
+pub const IDM_MD_CB_FOLD_TOGGLE: usize = 7304;
+
 pub const FIND_PANEL_W: i32 = 430;
 pub const FIND_PANEL_H: i32 = 108;
 pub const CF_UNICODETEXT_ID: u32 = 13;
@@ -694,7 +744,7 @@ pub fn build_main_menu() -> (HMENU, HMENU) {
         add(m_view, IDM_VIEW_LINENUM, "显示行号(&L)\tCtrl+Shift+L");
         add(m_view, IDM_VIEW_WHITESPACE, "显示空白字符(&S)");
         AppendMenuW(m_view, MF_SEPARATOR, 0, null());
-        add(m_view, IDM_VIEW_FOLD_TOGGLE, "折叠 / 展开当前标题\tCtrl+M");
+        add(m_view, IDM_VIEW_FOLD_TOGGLE, "折叠 / 展开当前标题或代码块\tCtrl+M");
         add(m_view, IDM_VIEW_FOLD_ALL, "全部折叠正文标题");
         add(m_view, IDM_VIEW_UNFOLD_ALL, "全部展开正文标题");
         AppendMenuW(m_view, MF_SEPARATOR, 0, null());
