@@ -24,7 +24,15 @@ use crate::{
     IDM_EDIT_DEL_LINE, IDM_EDIT_DUP_LINE, IDM_EDIT_LOWER, IDM_EDIT_MOVE_DOWN, IDM_EDIT_MOVE_UP,
     IDM_EDIT_PASTE, IDM_EDIT_REDO, IDM_EDIT_SELECT_ALL, IDM_EDIT_UNDO, IDM_EDIT_UPPER,
     IDM_EOL_CRLF, IDM_EOL_LF, IDM_FILE_EXIT, IDM_FILE_NEW, IDM_FILE_OPEN, IDM_FILE_RECENT_BASE,
-    IDM_FILE_RECENT_CLEAR, IDM_FILE_RELOAD, IDM_FILE_SAVE, IDM_FILE_SAVEAS,
+    IDM_FILE_RECENT_CLEAR, IDM_FILE_RELOAD, IDM_FILE_SAVE, IDM_FILE_SAVEAS, IDM_MD_BLK_BULLET,
+    IDM_MD_BLK_CODE, IDM_MD_BLK_H1, IDM_MD_BLK_H2, IDM_MD_BLK_H3, IDM_MD_BLK_H4, IDM_MD_BLK_H5,
+    IDM_MD_BLK_ORDERED, IDM_MD_BLK_PARA, IDM_MD_BLK_QUOTE, IDM_MD_BLK_TASK, IDM_MD_CB_COPY_FULL,
+    IDM_MD_CB_COPY_INNER, IDM_MD_CB_DELETE, IDM_MD_CB_FOLD_TOGGLE, IDM_MD_FMT_BOLD,
+    IDM_MD_FMT_CODE, IDM_MD_FMT_ITALIC, IDM_MD_FMT_LINK, IDM_MD_FMT_STRIKE, IDM_MD_INDENT,
+    IDM_MD_INS_BULLET, IDM_MD_INS_CAUTION, IDM_MD_INS_CODE, IDM_MD_INS_FORMULA, IDM_MD_INS_H1,
+    IDM_MD_INS_H2, IDM_MD_INS_H3, IDM_MD_INS_H4, IDM_MD_INS_H5, IDM_MD_INS_HR, IDM_MD_INS_IMAGE,
+    IDM_MD_INS_IMPORTANT, IDM_MD_INS_LINK, IDM_MD_INS_NOTE, IDM_MD_INS_ORDERED, IDM_MD_INS_QUOTE,
+    IDM_MD_INS_TABLE, IDM_MD_INS_TASK, IDM_MD_INS_TIP, IDM_MD_INS_WARNING, IDM_MD_OUTDENT,
     IDM_OUTLINE_COLLAPSE_ALL, IDM_OUTLINE_EXPAND_ALL, IDM_SEARCH_FIND, IDM_SEARCH_GOTO,
     IDM_SEARCH_NEXT, IDM_SEARCH_PREV, IDM_SEARCH_REPLACE, IDM_VIEW_FOLD_ALL, IDM_VIEW_FOLD_TOGGLE,
     IDM_VIEW_FONT, IDM_VIEW_LINENUM, IDM_VIEW_OUTLINE, IDM_VIEW_OUTLINE_FLOAT,
@@ -355,7 +363,7 @@ impl AppState {
     pub fn sync_wraps_after_edit(&mut self) {
         let patches: Vec<(usize, usize, usize)> = self.doc.wrap_patches.drain(..).collect();
         let max_px = self.wrap_max_px();
-        if self.line_wraps.len() == 0 || (self.wrap_active() && max_px != self.wrap_max_px_cached) {
+        if self.line_wraps.is_empty() || (self.wrap_active() && max_px != self.wrap_max_px_cached) {
             self.reset_wraps_lazy();
             return;
         }
@@ -938,7 +946,7 @@ impl AppState {
 }
 
 // ============================================================================
-// 菜单同步 & 右键上下文菜单
+// 菜单同步 & 分级右键上下文菜单（方案 A）
 // ============================================================================
 
 fn sync_recent_menu(state: &AppState) {
@@ -983,7 +991,7 @@ fn sync_menu_checks(state: &AppState, hmenu: HMENU) {
 fn show_editor_context_menu(state: &AppState, mx: i32, my: i32) {
     unsafe {
         let menu = CreatePopupMenu();
-        let add = |id: usize, label: &str, enabled: bool, checked: bool| {
+        let add = |m: HMENU, id: usize, label: &str, enabled: bool, checked: bool| {
             let w = to_wide(label);
             let mut flags = MF_STRING;
             if !enabled {
@@ -992,34 +1000,104 @@ fn show_editor_context_menu(state: &AppState, mx: i32, my: i32) {
             if checked {
                 flags |= MF_CHECKED;
             }
-            AppendMenuW(menu, flags, id, w.as_ptr());
+            AppendMenuW(m, flags, id, w.as_ptr());
         };
+        let add_pop = |parent: HMENU, child: HMENU, label: &str| {
+            let w = to_wide(label);
+            AppendMenuW(parent, MF_POPUP, child as usize, w.as_ptr());
+        };
+
+        let cur_line = state.doc.line_of_byte(state.doc.primary().head);
+        if let Some(cb) = state.doc.code_block_range_at(cur_line) {
+            let folded = state.doc.line_folded.get(cb.start_line).copied().unwrap_or(false);
+            add(menu, IDM_MD_CB_COPY_INNER, "复制代码块内容(&B)", true, false);
+            add(menu, IDM_MD_CB_COPY_FULL, "复制完整代码块 (含围栏)", true, false);
+            add(menu, IDM_MD_CB_FOLD_TOGGLE, "折叠 / 展开此代码块", true, folded);
+            add(menu, IDM_MD_CB_DELETE, "删除此代码块(&K)", true, false);
+            AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        }
+
+        // 段落与样式转换子菜单
+        let m_para = CreatePopupMenu();
+        add(m_para, IDM_MD_BLK_PARA, "正文 (T)", true, false);
+        add(m_para, IDM_MD_BLK_H1, "一级标题 (H1)", true, false);
+        add(m_para, IDM_MD_BLK_H2, "二级标题 (H2)", true, false);
+        add(m_para, IDM_MD_BLK_H3, "三级标题 (H3)", true, false);
+        add(m_para, IDM_MD_BLK_H4, "四级标题 (H4)", true, false);
+        add(m_para, IDM_MD_BLK_H5, "五级标题 (H5)", true, false);
+        AppendMenuW(m_para, MF_SEPARATOR, 0, null());
+        add(m_para, IDM_MD_BLK_BULLET, "无序列表 (- )", true, false);
+        add(m_para, IDM_MD_BLK_ORDERED, "有序列表 (1. )", true, false);
+        add(m_para, IDM_MD_BLK_TASK, "任务列表 (- [ ])", true, false);
+        add(m_para, IDM_MD_BLK_QUOTE, "引用块 (> )", true, false);
+        add(m_para, IDM_MD_BLK_CODE, "转为代码块 (```)", true, false);
+        AppendMenuW(m_para, MF_SEPARATOR, 0, null());
+        add(m_para, IDM_EDIT_DUP_LINE, "复制段落 / 行\tCtrl+D", true, false);
+        add(m_para, IDM_EDIT_MOVE_UP, "上移段落 / 行\tAlt+Up", true, false);
+        add(m_para, IDM_EDIT_MOVE_DOWN, "下移段落 / 行\tAlt+Down", true, false);
+        add(m_para, IDM_MD_INDENT, "增加缩进 (+)", true, false);
+        add(m_para, IDM_MD_OUTDENT, "减少缩进 (-)", true, false);
+        add(m_para, IDM_EDIT_DEL_LINE, "删除段落 / 行\tCtrl+Shift+K", true, false);
+        add_pop(menu, m_para, "段落与样式(&S)");
+
+        // 行内格式子菜单
+        let m_fmt = CreatePopupMenu();
+        add(m_fmt, IDM_MD_FMT_BOLD, "粗体 (**B**)", true, false);
+        add(m_fmt, IDM_MD_FMT_ITALIC, "斜体 (*I*)", true, false);
+        add(m_fmt, IDM_MD_FMT_CODE, "行内代码 (`</>`) ", true, false);
+        add(m_fmt, IDM_MD_FMT_STRIKE, "删除线 (~~S~~)", true, false);
+        add(m_fmt, IDM_MD_FMT_LINK, "链接 ([text](url))", true, false);
+        add_pop(menu, m_fmt, "行内格式(&F)");
+
+        // + 插入子菜单
+        let m_ins = CreatePopupMenu();
+        add(m_ins, IDM_MD_INS_H1, "一级标题 (H1)", true, false);
+        add(m_ins, IDM_MD_INS_H2, "二级标题 (H2)", true, false);
+        add(m_ins, IDM_MD_INS_H3, "三级标题 (H3)", true, false);
+        add(m_ins, IDM_MD_INS_H4, "四级标题 (H4)", true, false);
+        add(m_ins, IDM_MD_INS_H5, "五级标题 (H5)", true, false);
+        AppendMenuW(m_ins, MF_SEPARATOR, 0, null());
+        add(m_ins, IDM_MD_INS_BULLET, "无序列表", true, false);
+        add(m_ins, IDM_MD_INS_ORDERED, "有序列表", true, false);
+        add(m_ins, IDM_MD_INS_TASK, "任务列表", true, false);
+        add(m_ins, IDM_MD_INS_QUOTE, "引用块", true, false);
+        add(m_ins, IDM_MD_INS_CODE, "代码块 (```)", true, false);
+        add(m_ins, IDM_MD_INS_HR, "分割线 (---)", true, false);
+        AppendMenuW(m_ins, MF_SEPARATOR, 0, null());
+        add(m_ins, IDM_MD_INS_TABLE, "表格 (Table)", true, false);
+        AppendMenuW(m_ins, MF_SEPARATOR, 0, null());
+        add(m_ins, IDM_MD_INS_NOTE, "提示块 [!NOTE]", true, false);
+        add(m_ins, IDM_MD_INS_TIP, "技巧块 [!TIP]", true, false);
+        add(m_ins, IDM_MD_INS_IMPORTANT, "重要块 [!IMPORTANT]", true, false);
+        add(m_ins, IDM_MD_INS_WARNING, "警告块 [!WARNING]", true, false);
+        add(m_ins, IDM_MD_INS_CAUTION, "危险块 [!CAUTION]", true, false);
+        AppendMenuW(m_ins, MF_SEPARATOR, 0, null());
+        add(m_ins, IDM_MD_INS_LINK, "链接", true, false);
+        add(m_ins, IDM_MD_INS_FORMULA, "数学公式 ($$)", true, false);
+        add(m_ins, IDM_MD_INS_IMAGE, "图片", true, false);
+        add_pop(menu, m_ins, "+ 插入(&I)");
+
+        AppendMenuW(menu, MF_SEPARATOR, 0, null());
         let has_sel = state.doc.has_any_selection();
         let can_paste = IsClipboardFormatAvailable(CF_UNICODETEXT_ID) != 0;
-
-        add(IDM_EDIT_UNDO, "撤销(&U)\tCtrl+Z", state.doc.can_undo(), false);
-        add(IDM_EDIT_REDO, "重做(&R)\tCtrl+Y", state.doc.can_redo(), false);
+        add(menu, IDM_EDIT_UNDO, "撤销(&U)\tCtrl+Z", state.doc.can_undo(), false);
+        add(menu, IDM_EDIT_REDO, "重做(&R)\tCtrl+Y", state.doc.can_redo(), false);
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        add(IDM_EDIT_CUT, "剪切(&T)\tCtrl+X", !state.doc.text.is_empty(), false);
-        add(IDM_EDIT_COPY, "复制(&C)\tCtrl+C", !state.doc.text.is_empty(), false);
-        add(IDM_EDIT_PASTE, "粘贴(&P)\tCtrl+V", can_paste, false);
-        add(IDM_EDIT_DELETE, "删除(&D)", has_sel, false);
-        add(IDM_EDIT_SELECT_ALL, "全选(&A)\tCtrl+A", !state.doc.text.is_empty(), false);
+        add(menu, IDM_EDIT_CUT, "剪切(&T)\tCtrl+X", !state.doc.text.is_empty(), false);
+        add(menu, IDM_EDIT_COPY, "复制(&C)\tCtrl+C", !state.doc.text.is_empty(), false);
+        add(menu, IDM_EDIT_PASTE, "粘贴(&P)\tCtrl+V", can_paste, false);
+        add(menu, IDM_EDIT_DELETE, "删除(&D)", has_sel, false);
+        add(menu, IDM_EDIT_SELECT_ALL, "全选(&A)\tCtrl+A", !state.doc.text.is_empty(), false);
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        add(IDM_EDIT_DUP_LINE, "复制当前行\tCtrl+D", true, false);
-        add(IDM_EDIT_DEL_LINE, "删除当前行\tCtrl+Shift+K", true, false);
-        add(IDM_EDIT_COMMENT, "切换引用 / 注释\tCtrl+/", true, false);
+        add(menu, IDM_SEARCH_FIND, "查找(&Q)...\tCtrl+F", true, false);
+        add(menu, IDM_SEARCH_REPLACE, "替换(&H)...\tCtrl+H", true, false);
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        add(IDM_VIEW_FOLD_TOGGLE, "折叠 / 展开当前标题\tCtrl+M", true, false);
-        add(IDM_VIEW_FOLD_ALL, "全部折叠正文标题", true, false);
-        add(IDM_VIEW_UNFOLD_ALL, "全部展开正文标题", true, false);
-        AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        add(IDM_SEARCH_FIND, "查找(&F)...\tCtrl+F", true, false);
-        add(IDM_SEARCH_REPLACE, "替换(&H)...\tCtrl+H", true, false);
-        AppendMenuW(menu, MF_SEPARATOR, 0, null());
-        add(IDM_VIEW_WRAP, "自动换行(&W)", true, state.cfg.word_wrap);
-        add(IDM_VIEW_LINENUM, "显示行号(&L)", true, state.cfg.show_line_numbers);
-        add(IDM_VIEW_OUTLINE, "Markdown 大纲栏(&O)", true, state.cfg.outline_visible);
+        add(menu, IDM_VIEW_FOLD_TOGGLE, "折叠 / 展开当前块\tCtrl+M", true, false);
+        add(menu, IDM_VIEW_FOLD_ALL, "全部折叠正文标题", true, false);
+        add(menu, IDM_VIEW_UNFOLD_ALL, "全部展开正文标题", true, false);
+        add(menu, IDM_VIEW_WRAP, "自动换行(&W)", true, state.cfg.word_wrap);
+        add(menu, IDM_VIEW_LINENUM, "显示行号(&L)", true, state.cfg.show_line_numbers);
+        add(menu, IDM_VIEW_OUTLINE, "Markdown 大纲栏(&O)", true, state.cfg.outline_visible);
 
         let mut pt = POINT { x: mx, y: my };
         ClientToScreen(state.hwnd, &mut pt);
@@ -1208,6 +1286,16 @@ fn apply_theme_choice(state: &mut AppState, dark: bool) {
     state.invalidate();
 }
 
+fn toggle_fold_target(state: &mut AppState, fold_line: usize) {
+    if state.doc.toggle_fold_at_line(fold_line) {
+        let pos = state.doc.line_bounds(fold_line).0;
+        state.doc.cursors = vec![Cursor::collapsed(pos)];
+        state.rebuild_fold_row_counts();
+        state.ensure_caret_visible();
+        state.invalidate();
+    }
+}
+
 pub fn handle_command(state: &mut AppState, id: usize) {
     match id {
         IDM_FILE_NEW => {
@@ -1357,6 +1445,129 @@ pub fn handle_command(state: &mut AppState, id: usize) {
             state.invalidate();
         }
 
+        // 代码块专项操作
+        IDM_MD_CB_COPY_INNER | IDM_MD_CB_COPY_FULL => {
+            let cur_line = state.doc.line_of_byte(state.doc.primary().head);
+            if let Some(cb) = state.doc.code_block_range_at(cur_line) {
+                let txt = if id == IDM_MD_CB_COPY_INNER {
+                    state.doc.code_block_text(cb)
+                } else {
+                    state.doc.code_block_full_text(cb)
+                };
+                clipboard_copy(state.hwnd, &txt);
+            }
+        }
+        IDM_MD_CB_DELETE => {
+            let cur_line = state.doc.line_of_byte(state.doc.primary().head);
+            if let Some(cb) = state.doc.code_block_range_at(cur_line) {
+                state.doc.delete_code_block(cb);
+                state.doc.recompute_hidden_lines();
+                state.reset_wraps_lazy();
+                state.after_doc_edited();
+                state.invalidate();
+            }
+        }
+        IDM_MD_CB_FOLD_TOGGLE => {
+            let cur_line = state.doc.line_of_byte(state.doc.primary().head);
+            if let Some(cb) = state.doc.code_block_range_at(cur_line) {
+                toggle_fold_target(state, cb.start_line);
+            }
+        }
+
+        // Markdown 段落转换
+        IDM_MD_BLK_PARA..=IDM_MD_BLK_CODE => {
+            let style = match id {
+                IDM_MD_BLK_PARA => MdBlockStyle::Paragraph,
+                IDM_MD_BLK_H1 => MdBlockStyle::Heading(1),
+                IDM_MD_BLK_H2 => MdBlockStyle::Heading(2),
+                IDM_MD_BLK_H3 => MdBlockStyle::Heading(3),
+                IDM_MD_BLK_H4 => MdBlockStyle::Heading(4),
+                IDM_MD_BLK_H5 => MdBlockStyle::Heading(5),
+                IDM_MD_BLK_BULLET => MdBlockStyle::BulletList,
+                IDM_MD_BLK_ORDERED => MdBlockStyle::OrderedList,
+                IDM_MD_BLK_TASK => MdBlockStyle::TaskList,
+                IDM_MD_BLK_QUOTE => MdBlockStyle::Quote,
+                _ => MdBlockStyle::CodeBlock,
+            };
+            state.doc.transform_block_style(style);
+            state.after_doc_edited();
+            state.invalidate();
+        }
+        IDM_MD_INDENT => {
+            state.doc.indent_lines(true);
+            state.after_doc_edited();
+            state.invalidate();
+        }
+        IDM_MD_OUTDENT => {
+            state.doc.indent_lines(false);
+            state.after_doc_edited();
+            state.invalidate();
+        }
+
+        // Markdown 行内格式
+        IDM_MD_FMT_BOLD => {
+            state.doc.toggle_inline_wrap("**", "**", "粗体文本");
+            state.after_doc_edited();
+            state.invalidate();
+        }
+        IDM_MD_FMT_ITALIC => {
+            state.doc.toggle_inline_wrap("*", "*", "斜体文本");
+            state.after_doc_edited();
+            state.invalidate();
+        }
+        IDM_MD_FMT_CODE => {
+            state.doc.toggle_inline_wrap("`", "`", "code");
+            state.after_doc_edited();
+            state.invalidate();
+        }
+        IDM_MD_FMT_STRIKE => {
+            state.doc.toggle_inline_wrap("~~", "~~", "删除线");
+            state.after_doc_edited();
+            state.invalidate();
+        }
+        IDM_MD_FMT_LINK => {
+            let (s, e) = state.doc.primary().range();
+            if s < e {
+                let sel = state.doc.text[s..e].to_string();
+                let wrapped = format!("[{}](https://)", sel);
+                let url_s = s + 1 + sel.len() + 2;
+                state.doc.apply_edits(
+                    vec![(s, e, wrapped)],
+                    Some(vec![Cursor { anchor: url_s, head: url_s + 8 }]),
+                );
+            } else {
+                state.doc.insert_md_snippet("[链接文本](https://)", 1, 12, false);
+            }
+            state.after_doc_edited();
+            state.invalidate();
+        }
+
+        // + 插入模板
+        IDM_MD_INS_H1 => { state.doc.insert_md_snippet("# 标题", 2, 6, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_H2 => { state.doc.insert_md_snippet("## 标题", 3, 6, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_H3 => { state.doc.insert_md_snippet("### 标题", 4, 6, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_H4 => { state.doc.insert_md_snippet("#### 标题", 5, 6, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_H5 => { state.doc.insert_md_snippet("##### 标题", 6, 6, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_BULLET => { state.doc.insert_md_snippet("- 列表项", 2, 9, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_ORDERED => { state.doc.insert_md_snippet("1. 列表项", 3, 9, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_TASK => { state.doc.insert_md_snippet("- [ ] 任务项", 6, 9, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_QUOTE => { state.doc.insert_md_snippet("> 引用内容", 2, 12, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_CODE => { state.doc.insert_md_snippet("```\n\n```", 3, 0, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_HR => { state.doc.insert_md_snippet("---\n", 4, 0, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_TABLE => {
+            state.doc.insert_md_snippet("| 列1 | 列2 | 列3 |\n| :--- | :--- | :--- |\n|  |  |  |", 2, 4, true);
+            state.after_doc_edited();
+            state.invalidate();
+        }
+        IDM_MD_INS_NOTE => { state.doc.insert_md_snippet("> [!NOTE]\n> 提示内容", 12, 12, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_TIP => { state.doc.insert_md_snippet("> [!TIP]\n> 技巧内容", 11, 12, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_IMPORTANT => { state.doc.insert_md_snippet("> [!IMPORTANT]\n> 重要说明", 17, 12, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_WARNING => { state.doc.insert_md_snippet("> [!WARNING]\n> 警告内容", 15, 12, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_CAUTION => { state.doc.insert_md_snippet("> [!CAUTION]\n> 危险提示", 15, 12, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_LINK => { state.doc.insert_md_snippet("[链接文本](https://)", 1, 12, false); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_FORMULA => { state.doc.insert_md_snippet("$$\n\n$$", 3, 0, true); state.after_doc_edited(); state.invalidate(); }
+        IDM_MD_INS_IMAGE => { state.doc.insert_md_snippet("![图片描述](image.png)", 2, 12, false); state.after_doc_edited(); state.invalidate(); }
+
         IDM_SEARCH_FIND => state.show_find_panel(false),
         IDM_SEARCH_REPLACE => state.show_find_panel(true),
         IDM_SEARCH_NEXT | IDM_SEARCH_PREV => {
@@ -1397,14 +1608,10 @@ pub fn handle_command(state: &mut AppState, id: usize) {
         }
         IDM_VIEW_FOLD_TOGGLE => {
             let cur_line = state.doc.line_of_byte(state.doc.primary().head);
-            if let Some(hl) = state.doc.heading_for_line(cur_line) {
-                if state.doc.toggle_fold_at_line(hl) {
-                    let pos = state.doc.line_bounds(hl).0;
-                    state.doc.cursors = vec![Cursor::collapsed(pos)];
-                    state.rebuild_fold_row_counts();
-                    state.ensure_caret_visible();
-                    state.invalidate();
-                }
+            if let Some(cb) = state.doc.code_block_range_at(cur_line) {
+                toggle_fold_target(state, cb.start_line);
+            } else if let Some(hl) = state.doc.heading_for_line(cur_line) {
+                toggle_fold_target(state, hl);
             }
         }
         IDM_VIEW_FOLD_ALL => {
@@ -1721,7 +1928,6 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
             0
         }
         WM_SETCURSOR => {
-            // 来自子控件（如查找面板按钮/标签）的光标事件直接交还 DefWindowProcW
             if wp as HWND != hwnd {
                 return DefWindowProcW(hwnd, msg, wp, lp);
             }
