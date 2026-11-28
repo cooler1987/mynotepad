@@ -288,7 +288,10 @@ pub fn compute_line_wraps_with_dc(
     }
 
     let use_bold = is_md
-        && (line_str.trim_start().starts_with('#') || line_str.contains("**") || line_str.contains("__"));
+        && (line_str.trim_start().starts_with('#')
+            || line_str.contains("**")
+            || line_str.contains("__")
+            || line_str.contains("]("));
     unsafe {
         SelectObject(hdc, if use_bold { font_bold } else { font_regular } as _);
     }
@@ -575,6 +578,79 @@ pub fn paint_floating_outline(state: &AppState, hdc_win: HDC, w: i32, h: i32) {
     }
 }
 
+pub fn measure_line_prefix_x(
+    hdc: HDC,
+    draw_slice: &str,
+    safe_bs: usize,
+    rel_byte: usize,
+    tokens: &[(usize, usize, TokenKind)],
+    show_ws: bool,
+    hfont_regular: HFONT,
+    hfont_bold: HFONT,
+    hfont_italic: HFONT,
+    hfont_strike: HFONT,
+) -> i32 {
+    let target_rel = floor_char_boundary(draw_slice, rel_byte.min(draw_slice.len()));
+    if target_rel == 0 {
+        return 0;
+    }
+    let sub_slice = &draw_slice[..target_rel];
+    let seg_end_rel = safe_bs + target_rel;
+    let mut x_acc = 0i32;
+    let mut col_acc = 0usize;
+    let mut pos = 0usize;
+
+    let mut measure_chunk = |chunk: &str, font: HFONT| {
+        if chunk.is_empty() {
+            return;
+        }
+        let (shown, next_col) = expand_tabs_col(chunk, col_acc, show_ws);
+        col_acc = next_col;
+        let wtxt = to_wide(&shown);
+        let clen = (wtxt.len() - 1) as i32;
+        unsafe {
+            SelectObject(hdc, font as _);
+            let mut sz: SIZE = std::mem::zeroed();
+            GetTextExtentPoint32W(hdc, wtxt.as_ptr(), clen, &mut sz);
+            x_acc += sz.cx;
+        }
+    };
+
+    for &(ts, te, kind) in tokens {
+        if te <= safe_bs || ts >= seg_end_rel {
+            continue;
+        }
+        let ls = floor_char_boundary(sub_slice, ts.saturating_sub(safe_bs));
+        let le = floor_char_boundary(sub_slice, te.min(seg_end_rel) - safe_bs);
+        let p_safe = floor_char_boundary(sub_slice, pos);
+        if ls > p_safe {
+            measure_chunk(&sub_slice[p_safe..ls], hfont_regular);
+        }
+        let tfont = match kind {
+            TokenKind::Heading1
+            | TokenKind::Heading2
+            | TokenKind::Heading3
+            | TokenKind::Attachment
+            | TokenKind::Bold
+            | TokenKind::AlertTag
+            | TokenKind::TaskDone
+            | TokenKind::TaskTodo => hfont_bold,
+            TokenKind::Italic => hfont_italic,
+            TokenKind::Strike => hfont_strike,
+            _ => hfont_regular,
+        };
+        if le > ls {
+            measure_chunk(&sub_slice[ls..le], tfont);
+        }
+        pos = p_safe.max(le);
+    }
+    let p_safe = floor_char_boundary(sub_slice, pos);
+    if p_safe < sub_slice.len() {
+        measure_chunk(&sub_slice[p_safe..], hfont_regular);
+    }
+    x_acc
+}
+
 pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
     state.ensure_viewport_wraps();
 
@@ -727,16 +803,22 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
             let seg_x = |abs_byte: usize| -> i32 {
                 let raw_rel = abs_byte.saturating_sub(seg_abs_start).min(draw_slice.len());
                 let rel = floor_char_boundary(draw_slice, raw_rel);
-                let sub = &draw_slice[..rel];
-                if sub.is_empty() {
+                if rel == 0 {
                     return text_left;
                 }
-                let (exp, _) = expand_tabs_col(sub, 0, state.cfg.show_whitespace);
-                let ew = to_wide(&exp);
-                let mut sz: SIZE = std::mem::zeroed();
-                SelectObject(mem_dc, state.hfont_regular as _);
-                GetTextExtentPoint32W(mem_dc, ew.as_ptr(), (ew.len() - 1) as i32, &mut sz);
-                text_left + sz.cx
+                text_left
+                    + measure_line_prefix_x(
+                        mem_dc,
+                        draw_slice,
+                        safe_bs,
+                        rel,
+                        &cached_tokens,
+                        state.cfg.show_whitespace,
+                        state.hfont_regular,
+                        state.hfont_bold,
+                        state.hfont_italic,
+                        state.hfont_strike,
+                    )
             };
 
             if let Some((b1, b2)) = bracket_pair {
