@@ -13,9 +13,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use crate::engine::*;
 use crate::render::{
-    apply_titlebar_theme, compute_line_wraps_with_dc, expand_tabs_col, expand_tabs_with_u16_map,
-    get_theme, paint_editor, paint_floating_outline, VisualSeg, FOLD_COL_W, OUTLINE_HEADER_H,
-    OUTLINE_ROW_H, STATUS_BAR_HEIGHT,
+    apply_titlebar_theme, compute_line_wraps_with_dc, measure_line_prefix_x, get_theme,
+    paint_editor, paint_floating_outline, VisualSeg, FOLD_COL_W, OUTLINE_HEADER_H, OUTLINE_ROW_H,
+    STATUS_BAR_HEIGHT,
 };
 use crate::{
     clipboard_copy, clipboard_paste, dialog_choose_font, dialog_open_attachment, dialog_open_file,
@@ -579,30 +579,48 @@ impl AppState {
         self.update_scrollbars();
     }
 
-    fn measure_byte_x(&mut self, byte_pos: usize) -> i32 {
+        fn measure_byte_x(&mut self, byte_pos: usize) -> i32 {
         let line = self.doc.line_of_byte(byte_pos);
-        let seg_start = if self.wrap_active() {
+        let seg = if self.wrap_active() {
             let vrow = self.byte_to_visual_row(byte_pos);
-            let seg = self.get_visual_seg(vrow);
-            self.doc.line_starts[line] + seg.map(|s| s.b_start).unwrap_or(0)
+            self.get_visual_seg(vrow)
         } else {
-            self.doc.line_starts[line]
+            let (s, e) = self.doc.line_bounds(line);
+            Some(VisualSeg { line, b_start: 0, b_end: e - s })
         };
-        let end = byte_pos.max(seg_start).min(self.doc.text.len());
-        let slice = &self.doc.text[seg_start..end];
-        if slice.len() > 8192 {
-            return (slice.len() as i32) * self.avg_char_w;
+        let Some(seg) = seg else {
+            return 0;
+        };
+        let line_start = self.doc.line_starts[line];
+        let seg_abs_start = line_start + seg.b_start;
+        let seg_str = &self.doc.text[seg_abs_start..line_start + seg.b_end];
+        let rel = byte_pos.saturating_sub(seg_abs_start).min(seg_str.len());
+        if rel > 8192 {
+            return (rel as i32) * self.avg_char_w;
         }
-        let (expanded, _) = expand_tabs_col(slice, 0, self.cfg.show_whitespace);
-        let w = to_wide(&expanded);
+        let full_line = self.doc.line_str(line);
+        let line_state = self.doc.line_states.get(line).copied().unwrap_or(LineState::Normal);
+        let (tokens, _) = if full_line.len() <= 8192 {
+            highlight_line_with_state(self.doc.lang, full_line, line_state)
+        } else {
+            (Vec::new(), LineAttr::default())
+        };
         unsafe {
             let hdc = GetDC(self.hwnd);
-            let old = SelectObject(hdc, self.hfont_regular as _);
-            let mut sz: SIZE = std::mem::zeroed();
-            GetTextExtentPoint32W(hdc, w.as_ptr(), (w.len() - 1) as i32, &mut sz);
-            SelectObject(hdc, old);
+            let x = measure_line_prefix_x(
+                hdc,
+                seg_str,
+                seg.b_start,
+                rel,
+                &tokens,
+                self.cfg.show_whitespace,
+                self.hfont_regular,
+                self.hfont_bold,
+                self.hfont_italic,
+                self.hfont_strike,
+            );
             ReleaseDC(self.hwnd, hdc);
-            sz.cx
+            x
         }
     }
 
@@ -630,34 +648,72 @@ impl AppState {
             return (abs, seg.line, col);
         }
 
-        let (expanded, map) = expand_tabs_with_u16_map(seg_str, self.cfg.show_whitespace, true);
-        let w = to_wide(&expanded);
-        let u16_len = (w.len() - 1) as i32;
-        let mut fit: i32 = 0;
-        let mut sz: SIZE = unsafe { std::mem::zeroed() };
+        let full_line = self.doc.line_str(seg.line);
+        let line_state = self.doc.line_states.get(seg.line).copied().unwrap_or(LineState::Normal);
+        let (tokens, _) = if full_line.len() <= 8192 {
+            highlight_line_with_state(self.doc.lang, full_line, line_state)
+        } else {
+            (Vec::new(), LineAttr::default())
+        };
+        let mut bounds: Vec<usize> = seg_str.char_indices().map(|(i, _)| i).collect();
+        bounds.push(seg_str.len());
+
         unsafe {
             let hdc = GetDC(self.hwnd);
-            let old = SelectObject(hdc, self.hfont_regular as _);
-            GetTextExtentExPointW(hdc, w.as_ptr(), u16_len, px, &mut fit, null_mut(), &mut sz);
-            let mut best = fit.max(0) as usize;
-            if best < u16_len as usize {
-                let mut s1: SIZE = std::mem::zeroed();
-                let mut s2: SIZE = std::mem::zeroed();
-                GetTextExtentPoint32W(hdc, w.as_ptr(), best as i32, &mut s1);
-                let next_u16 = if w[best] >= 0xD800 && w[best] <= 0xDBFF && best + 1 < u16_len as usize {
-                    best + 2
+            let mut lo = 0usize;
+            let mut hi = bounds.len() - 1;
+            while lo < hi {
+                let mid = (lo + hi + 1) / 2;
+                let cx = measure_line_prefix_x(
+                    hdc,
+                    seg_str,
+                    seg.b_start,
+                    bounds[mid],
+                    &tokens,
+                    self.cfg.show_whitespace,
+                    self.hfont_regular,
+                    self.hfont_bold,
+                    self.hfont_italic,
+                    self.hfont_strike,
+                );
+                if cx <= px {
+                    lo = mid;
                 } else {
-                    best + 1
-                };
-                GetTextExtentPoint32W(hdc, w.as_ptr(), next_u16 as i32, &mut s2);
-                if (px - s1.cx) > (s2.cx - px) {
-                    best = next_u16;
+                    hi = mid - 1;
                 }
             }
-            SelectObject(hdc, old);
+            let mut best_idx = lo;
+            if lo + 1 < bounds.len() {
+                let x1 = measure_line_prefix_x(
+                    hdc,
+                    seg_str,
+                    seg.b_start,
+                    bounds[lo],
+                    &tokens,
+                    self.cfg.show_whitespace,
+                    self.hfont_regular,
+                    self.hfont_bold,
+                    self.hfont_italic,
+                    self.hfont_strike,
+                );
+                let x2 = measure_line_prefix_x(
+                    hdc,
+                    seg_str,
+                    seg.b_start,
+                    bounds[lo + 1],
+                    &tokens,
+                    self.cfg.show_whitespace,
+                    self.hfont_regular,
+                    self.hfont_bold,
+                    self.hfont_italic,
+                    self.hfont_strike,
+                );
+                if (px - x1) > (x2 - px) {
+                    best_idx = lo + 1;
+                }
+            }
             ReleaseDC(self.hwnd, hdc);
-            let rel_byte = map[best.min(map.len() - 1)];
-            let abs = line_start + seg.b_start + rel_byte;
+            let abs = line_start + seg.b_start + bounds[best_idx];
             let (_, col) = self.doc.byte_to_line_col(abs);
             (abs, seg.line, col)
         }
