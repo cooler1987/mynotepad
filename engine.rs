@@ -2370,11 +2370,10 @@ pub fn highlight_line_with_state(
 ) -> (Vec<(usize, usize, TokenKind)>, LineAttr) {
     let mut out = Vec::new();
     let mut attr = LineAttr::default();
-    if line.is_empty() || lang == Lang::Plain {
-        return (out, attr);
+    if lang == Lang::Markdown && matches!(state, LineState::FencedCode { .. }) {
+        attr.is_code_block = true;
     }
-    if lang != Lang::Markdown {
-        highlight_code_line(lang, line, &mut out);
+    if line.is_empty() || lang == Lang::Plain {
         return (out, attr);
     }
 
