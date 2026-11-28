@@ -18,27 +18,28 @@ use crate::render::{
     OUTLINE_ROW_H, STATUS_BAR_HEIGHT,
 };
 use crate::{
-    clipboard_copy, clipboard_paste, dialog_choose_font, dialog_open_file, dialog_save_file,
-    show_goto_dialog, CF_UNICODETEXT_ID, FIND_PANEL_H, FIND_PANEL_W, IDC_BTN_REPLACE,
-    IDC_BTN_REPLACE_ALL, IDM_EDIT_COMMENT, IDM_EDIT_COPY, IDM_EDIT_CUT, IDM_EDIT_DELETE,
-    IDM_EDIT_DEL_LINE, IDM_EDIT_DUP_LINE, IDM_EDIT_LOWER, IDM_EDIT_MOVE_DOWN, IDM_EDIT_MOVE_UP,
-    IDM_EDIT_PASTE, IDM_EDIT_REDO, IDM_EDIT_SELECT_ALL, IDM_EDIT_UNDO, IDM_EDIT_UPPER,
-    IDM_EOL_CRLF, IDM_EOL_LF, IDM_FILE_EXIT, IDM_FILE_NEW, IDM_FILE_OPEN, IDM_FILE_RECENT_BASE,
-    IDM_FILE_RECENT_CLEAR, IDM_FILE_RELOAD, IDM_FILE_SAVE, IDM_FILE_SAVEAS, IDM_MD_BLK_BULLET,
-    IDM_MD_BLK_CODE, IDM_MD_BLK_H1, IDM_MD_BLK_H2, IDM_MD_BLK_H3, IDM_MD_BLK_H4, IDM_MD_BLK_H5,
+    clipboard_copy, clipboard_paste, dialog_choose_font, dialog_open_attachment, dialog_open_file,
+    dialog_save_file, shell_open_target, shell_reveal_attachment_dir, show_goto_dialog,
+    CF_UNICODETEXT_ID, FIND_PANEL_H, FIND_PANEL_W, IDC_BTN_REPLACE, IDC_BTN_REPLACE_ALL,
+    IDM_EDIT_COMMENT, IDM_EDIT_COPY, IDM_EDIT_CUT, IDM_EDIT_DELETE, IDM_EDIT_DEL_LINE,
+    IDM_EDIT_DUP_LINE, IDM_EDIT_LOWER, IDM_EDIT_MOVE_DOWN, IDM_EDIT_MOVE_UP, IDM_EDIT_PASTE,
+    IDM_EDIT_REDO, IDM_EDIT_SELECT_ALL, IDM_EDIT_UNDO, IDM_EDIT_UPPER, IDM_EOL_CRLF, IDM_EOL_LF,
+    IDM_FILE_EXIT, IDM_FILE_NEW, IDM_FILE_OPEN, IDM_FILE_RECENT_BASE, IDM_FILE_RECENT_CLEAR,
+    IDM_FILE_RELOAD, IDM_FILE_SAVE, IDM_FILE_SAVEAS, IDM_MD_BLK_BULLET, IDM_MD_BLK_CODE,
+    IDM_MD_BLK_H1, IDM_MD_BLK_H2, IDM_MD_BLK_H3, IDM_MD_BLK_H4, IDM_MD_BLK_H5,
     IDM_MD_BLK_ORDERED, IDM_MD_BLK_PARA, IDM_MD_BLK_QUOTE, IDM_MD_BLK_TASK, IDM_MD_CB_COPY_FULL,
     IDM_MD_CB_COPY_INNER, IDM_MD_CB_DELETE, IDM_MD_CB_FOLD_TOGGLE, IDM_MD_FMT_BOLD,
     IDM_MD_FMT_CODE, IDM_MD_FMT_ITALIC, IDM_MD_FMT_LINK, IDM_MD_FMT_STRIKE, IDM_MD_INDENT,
-    IDM_MD_INS_BULLET, IDM_MD_INS_CAUTION, IDM_MD_INS_CODE, IDM_MD_INS_FORMULA, IDM_MD_INS_H1,
-    IDM_MD_INS_H2, IDM_MD_INS_H3, IDM_MD_INS_H4, IDM_MD_INS_H5, IDM_MD_INS_HR, IDM_MD_INS_IMAGE,
+    IDM_MD_INS_ATTACH, IDM_MD_INS_BULLET, IDM_MD_INS_CAUTION, IDM_MD_INS_CODE, IDM_MD_INS_FORMULA,
+    IDM_MD_INS_H1, IDM_MD_INS_H2, IDM_MD_INS_H3, IDM_MD_INS_H4, IDM_MD_INS_H5, IDM_MD_INS_HR,
     IDM_MD_INS_IMPORTANT, IDM_MD_INS_LINK, IDM_MD_INS_NOTE, IDM_MD_INS_ORDERED, IDM_MD_INS_QUOTE,
-    IDM_MD_INS_TABLE, IDM_MD_INS_TASK, IDM_MD_INS_TIP, IDM_MD_INS_WARNING, IDM_MD_OUTDENT,
-    IDM_OUTLINE_COLLAPSE_ALL, IDM_OUTLINE_EXPAND_ALL, IDM_SEARCH_FIND, IDM_SEARCH_GOTO,
-    IDM_SEARCH_NEXT, IDM_SEARCH_PREV, IDM_SEARCH_REPLACE, IDM_VIEW_FOLD_ALL, IDM_VIEW_FOLD_TOGGLE,
-    IDM_VIEW_FONT, IDM_VIEW_LINENUM, IDM_VIEW_OUTLINE, IDM_VIEW_OUTLINE_FLOAT,
-    IDM_VIEW_OUTLINE_REFRESH, IDM_VIEW_THEME_DARK, IDM_VIEW_THEME_LIGHT, IDM_VIEW_TOPMOST,
-    IDM_VIEW_UNFOLD_ALL, IDM_VIEW_WHITESPACE, IDM_VIEW_WRAP, IDM_VIEW_ZOOM_IN, IDM_VIEW_ZOOM_OUT,
-    IDM_VIEW_ZOOM_RESET,
+    IDM_MD_INS_TABLE, IDM_MD_INS_TASK, IDM_MD_INS_TIP, IDM_MD_INS_WARNING, IDM_MD_OPEN_ATTACH,
+    IDM_MD_OPEN_ATTACH_DIR, IDM_MD_OUTDENT, IDM_OUTLINE_COLLAPSE_ALL, IDM_OUTLINE_EXPAND_ALL,
+    IDM_SEARCH_FIND, IDM_SEARCH_GOTO, IDM_SEARCH_NEXT, IDM_SEARCH_PREV, IDM_SEARCH_REPLACE,
+    IDM_VIEW_FOLD_ALL, IDM_VIEW_FOLD_TOGGLE, IDM_VIEW_FONT, IDM_VIEW_LINENUM, IDM_VIEW_LOG,
+    IDM_VIEW_OUTLINE, IDM_VIEW_OUTLINE_FLOAT, IDM_VIEW_OUTLINE_REFRESH, IDM_VIEW_THEME_DARK,
+    IDM_VIEW_THEME_LIGHT, IDM_VIEW_TOPMOST, IDM_VIEW_UNFOLD_ALL, IDM_VIEW_WHITESPACE,
+    IDM_VIEW_WRAP, IDM_VIEW_ZOOM_IN, IDM_VIEW_ZOOM_OUT, IDM_VIEW_ZOOM_RESET,
 };
 
 #[inline]
@@ -983,9 +984,16 @@ fn sync_menu_checks(state: &AppState, hmenu: HMENU) {
     chk(IDM_VIEW_THEME_DARK, state.cfg.dark_theme);
     chk(IDM_VIEW_THEME_LIGHT, !state.cfg.dark_theme);
     chk(IDM_VIEW_TOPMOST, state.cfg.always_on_top);
+    chk(IDM_VIEW_LOG, state.cfg.enable_log);
     chk(IDM_EOL_CRLF, state.doc.line_ending == LineEnding::Crlf);
     chk(IDM_EOL_LF, state.doc.line_ending == LineEnding::Lf);
     sync_recent_menu(state);
+}
+
+fn active_link_near_caret(doc: &Document) -> Option<MdLinkSpan> {
+    let head = doc.primary().head;
+    let cur_line = doc.line_of_byte(head);
+    doc.link_at_byte(head).or_else(|| doc.first_link_on_line(cur_line))
 }
 
 fn show_editor_context_menu(state: &AppState, mx: i32, my: i32) {
@@ -1007,6 +1015,20 @@ fn show_editor_context_menu(state: &AppState, mx: i32, my: i32) {
             AppendMenuW(parent, MF_POPUP, child as usize, w.as_ptr());
         };
 
+        // 1. 识别当前光标/右键行是否命中图片、音视频或附件链接
+        if let Some(link) = active_link_near_caret(&state.doc) {
+            let short_name: String = link.label.chars().take(28).collect();
+            let open_lbl = if link.is_image {
+                format!("打开图片: {} (Ctrl+单击)", short_name)
+            } else {
+                format!("打开附件 / 链接: {} (Ctrl+单击)", short_name)
+            };
+            add(menu, IDM_MD_OPEN_ATTACH, &open_lbl, true, false);
+            add(menu, IDM_MD_OPEN_ATTACH_DIR, "打开附件所在文件夹 (files)", true, false);
+            AppendMenuW(menu, MF_SEPARATOR, 0, null());
+        }
+
+        // 2. 识别当前是否处于围栏代码块内
         let cur_line = state.doc.line_of_byte(state.doc.primary().head);
         if let Some(cb) = state.doc.code_block_range_at(cur_line) {
             let folded = state.doc.line_folded.get(cb.start_line).copied().unwrap_or(false);
@@ -1017,7 +1039,7 @@ fn show_editor_context_menu(state: &AppState, mx: i32, my: i32) {
             AppendMenuW(menu, MF_SEPARATOR, 0, null());
         }
 
-        // 段落与样式转换子菜单
+        // 3. 段落与样式转换子菜单
         let m_para = CreatePopupMenu();
         add(m_para, IDM_MD_BLK_PARA, "正文 (T)", true, false);
         add(m_para, IDM_MD_BLK_H1, "一级标题 (H1)", true, false);
@@ -1040,17 +1062,19 @@ fn show_editor_context_menu(state: &AppState, mx: i32, my: i32) {
         add(m_para, IDM_EDIT_DEL_LINE, "删除段落 / 行\tCtrl+Shift+K", true, false);
         add_pop(menu, m_para, "段落与样式(&S)");
 
-        // 行内格式子菜单
+        // 4. 行内格式子菜单
         let m_fmt = CreatePopupMenu();
         add(m_fmt, IDM_MD_FMT_BOLD, "粗体 (**B**)", true, false);
         add(m_fmt, IDM_MD_FMT_ITALIC, "斜体 (*I*)", true, false);
-        add(m_fmt, IDM_MD_FMT_CODE, "行内代码 (`</>`) ", true, false);
+        add(m_fmt, IDM_MD_FMT_CODE, "行内代码 (`</>`)", true, false);
         add(m_fmt, IDM_MD_FMT_STRIKE, "删除线 (~~S~~)", true, false);
         add(m_fmt, IDM_MD_FMT_LINK, "链接 ([text](url))", true, false);
         add_pop(menu, m_fmt, "行内格式(&F)");
 
-        // + 插入子菜单
+        // 5. + 插入子菜单
         let m_ins = CreatePopupMenu();
+        add(m_ins, IDM_MD_INS_ATTACH, "图片 / 附件 (复制到 files 目录)...", true, false);
+        AppendMenuW(m_ins, MF_SEPARATOR, 0, null());
         add(m_ins, IDM_MD_INS_H1, "一级标题 (H1)", true, false);
         add(m_ins, IDM_MD_INS_H2, "二级标题 (H2)", true, false);
         add(m_ins, IDM_MD_INS_H3, "三级标题 (H3)", true, false);
@@ -1072,9 +1096,8 @@ fn show_editor_context_menu(state: &AppState, mx: i32, my: i32) {
         add(m_ins, IDM_MD_INS_WARNING, "警告块 [!WARNING]", true, false);
         add(m_ins, IDM_MD_INS_CAUTION, "危险块 [!CAUTION]", true, false);
         AppendMenuW(m_ins, MF_SEPARATOR, 0, null());
-        add(m_ins, IDM_MD_INS_LINK, "链接", true, false);
+        add(m_ins, IDM_MD_INS_LINK, "网页链接", true, false);
         add(m_ins, IDM_MD_INS_FORMULA, "数学公式 ($$)", true, false);
-        add(m_ins, IDM_MD_INS_IMAGE, "图片", true, false);
         add_pop(menu, m_ins, "+ 插入(&I)");
 
         AppendMenuW(menu, MF_SEPARATOR, 0, null());
@@ -1445,6 +1468,18 @@ pub fn handle_command(state: &mut AppState, id: usize) {
             state.invalidate();
         }
 
+        // 附件打开与定位
+        IDM_MD_OPEN_ATTACH => {
+            if let Some(link) = active_link_near_caret(&state.doc) {
+                shell_open_target(state.hwnd, &link.target, state.doc.path.as_deref());
+            }
+        }
+        IDM_MD_OPEN_ATTACH_DIR => {
+            if let Some(link) = active_link_near_caret(&state.doc) {
+                shell_reveal_attachment_dir(state.hwnd, &link.target, state.doc.path.as_deref());
+            }
+        }
+
         // 代码块专项操作
         IDM_MD_CB_COPY_INNER | IDM_MD_CB_COPY_FULL => {
             let cur_line = state.doc.line_of_byte(state.doc.primary().head);
@@ -1542,7 +1577,24 @@ pub fn handle_command(state: &mut AppState, id: usize) {
             state.invalidate();
         }
 
-        // + 插入模板
+        // + 插入模板与图片/附件
+        IDM_MD_INS_ATTACH => {
+            if let Some(src_path) = dialog_open_attachment(state.hwnd) {
+                match copy_to_portable_files_dir(&src_path) {
+                    Ok(filename) => {
+                        let snippet = format_md_attachment_snippet(&filename);
+                        let len = snippet.len();
+                        state.doc.insert_md_snippet(&snippet, len, 0, false);
+                        state.after_doc_edited();
+                        state.invalidate();
+                    }
+                    Err(err) => {
+                        log_msg("ERROR", &err);
+                        show_fatal_box("插入图片 / 附件失败", &err);
+                    }
+                }
+            }
+        }
         IDM_MD_INS_H1 => { state.doc.insert_md_snippet("# 标题", 2, 6, true); state.after_doc_edited(); state.invalidate(); }
         IDM_MD_INS_H2 => { state.doc.insert_md_snippet("## 标题", 3, 6, true); state.after_doc_edited(); state.invalidate(); }
         IDM_MD_INS_H3 => { state.doc.insert_md_snippet("### 标题", 4, 6, true); state.after_doc_edited(); state.invalidate(); }
@@ -1566,7 +1618,6 @@ pub fn handle_command(state: &mut AppState, id: usize) {
         IDM_MD_INS_CAUTION => { state.doc.insert_md_snippet("> [!CAUTION]\n> 危险提示", 15, 12, true); state.after_doc_edited(); state.invalidate(); }
         IDM_MD_INS_LINK => { state.doc.insert_md_snippet("[链接文本](https://)", 1, 12, false); state.after_doc_edited(); state.invalidate(); }
         IDM_MD_INS_FORMULA => { state.doc.insert_md_snippet("$$\n\n$$", 3, 0, true); state.after_doc_edited(); state.invalidate(); }
-        IDM_MD_INS_IMAGE => { state.doc.insert_md_snippet("![图片描述](image.png)", 2, 12, false); state.after_doc_edited(); state.invalidate(); }
 
         IDM_SEARCH_FIND => state.show_find_panel(false),
         IDM_SEARCH_REPLACE => state.show_find_panel(true),
@@ -1680,6 +1731,11 @@ pub fn handle_command(state: &mut AppState, id: usize) {
                     SetWindowPos(state.outline_hwnd, insert_after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                 }
             }
+            save_config(&state.cfg);
+        }
+        IDM_VIEW_LOG => {
+            state.cfg.enable_log = !state.cfg.enable_log;
+            set_log_enabled(state.cfg.enable_log);
             save_config(&state.cfg);
         }
         IDM_VIEW_ZOOM_IN => {
@@ -1940,6 +1996,13 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
                 if docked_outline && pt.y < st.client_h - STATUS_BAR_HEIGHT && (pt.x - edit_r).abs() <= 4 {
                     SetCursor(LoadCursorW(null_mut(), IDC_SIZEWE));
                 } else if pt.x >= st.gutter_w && pt.x < edit_r && pt.y < st.client_h - STATUS_BAR_HEIGHT {
+                    if key_down(VK_CONTROL) {
+                        let (pos, _, _) = st.hit_test(pt.x, pt.y);
+                        if st.doc.link_at_byte(pos).is_some() {
+                            SetCursor(LoadCursorW(null_mut(), IDC_HAND));
+                            return 1;
+                        }
+                    }
                     SetCursor(LoadCursorW(null_mut(), IDC_IBEAM));
                 } else {
                     SetCursor(LoadCursorW(null_mut(), IDC_ARROW));
@@ -2024,9 +2087,16 @@ pub unsafe extern "system" fn main_wnd_proc(hwnd: HWND, msg: u32, wp: usize, lp:
             }
 
             SetFocus(hwnd);
+            let (pos, line, col) = st.hit_test(mx, my);
+            if key_down(VK_CONTROL) && !key_down(VK_MENU) {
+                if let Some(link) = st.doc.link_at_byte(pos) {
+                    shell_open_target(hwnd, &link.target, st.doc.path.as_deref());
+                    return 0;
+                }
+            }
+
             SetCapture(hwnd);
             st.dragging = true;
-            let (pos, line, col) = st.hit_test(mx, my);
             if key_down(VK_MENU) {
                 st.rect_selecting = true;
                 st.rect_anchor = (line, col);
