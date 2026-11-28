@@ -376,7 +376,7 @@ pub fn save_file_with_encoding(
 }
 
 // ============================================================================
-// 4. 高性能文本缓冲、正文标题级别折叠、多行语法状态与撤销重做引擎
+// 4. 高性能文本缓冲、标题/代码块折叠、MD编辑操作与撤销重做引擎
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -415,9 +415,34 @@ struct UndoEntry {
     cursors_after: Vec<Cursor>,
 }
 
-fn detect_heading_level(line: &str, state: LineState) -> u8 {
+#[derive(Clone, Copy)]
+pub struct CodeBlockRange {
+    pub start_line: usize,
+    pub end_line: usize,
+    pub has_closing_fence: bool,
+    pub inner_start_byte: usize,
+    pub inner_end_byte: usize,
+    pub block_start_byte: usize,
+    pub block_end_byte: usize,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MdBlockStyle {
+    Paragraph,
+    Heading(u8),
+    BulletList,
+    OrderedList,
+    TaskList,
+    Quote,
+    CodeBlock,
+}
+
+fn detect_fold_level(line: &str, state: LineState) -> u8 {
     if !matches!(state, LineState::Normal) {
         return 0;
+    }
+    if parse_fence_open(line).is_some() {
+        return 7; // 7 表示围栏代码块起始行（可独立折叠）
     }
     let trimmed = line.trim_start();
     let ws = line.len() - trimmed.len();
@@ -435,13 +460,62 @@ fn detect_heading_level(line: &str, state: LineState) -> u8 {
     0
 }
 
+fn strip_md_block_prefix(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    let b = trimmed.as_bytes();
+    if b.is_empty() {
+        return "";
+    }
+    // 剥离标题 #..######
+    if b[0] == b'#' {
+        let mut h = 0;
+        while h < b.len() && b[h] == b'#' {
+            h += 1;
+        }
+        if (1..=6).contains(&h) && (h == b.len() || b[h] == b' ' || b[h] == b'\t') {
+            return trimmed[h..].trim_start();
+        }
+    }
+    // 剥离引用 >
+    if b[0] == b'>' {
+        let rest = &trimmed[1..];
+        return rest.strip_prefix(' ').unwrap_or(rest);
+    }
+    // 剥离任务列表与无序列表
+    if matches!(b[0], b'-' | b'*' | b'+') && b.get(1).copied().is_some_and(|c| c == b' ' || c == b'\t') {
+        let after = trimmed[2..].trim_start();
+        if after.starts_with("[ ] ") || after.starts_with("[x] ") || after.starts_with("[X] ") {
+            return &after[4..];
+        }
+        if after == "[ ]" || after == "[x]" || after == "[X]" {
+            return "";
+        }
+        return after;
+    }
+    // 剥离有序列表 1. / 1)
+    let mut d = 0usize;
+    while d < b.len() && b[d].is_ascii_digit() && d < 9 {
+        d += 1;
+    }
+    if d > 0 && d + 1 < b.len() && (b[d] == b'.' || b[d] == b')') && (b[d + 1] == b' ' || b[d + 1] == b'\t') {
+        return trimmed[d + 2..].trim_start();
+    }
+    trimmed
+}
+
+#[derive(Clone, Copy)]
+enum ActiveFold {
+    Heading(u8),
+    CodeBlock,
+}
+
 pub struct Document {
     pub text: String,
     pub line_starts: Vec<usize>,
     pub line_states: Vec<LineState>,
-    pub line_levels: Vec<u8>,   // 0=正文, 1..=6=MD标题级别
-    pub line_folded: Vec<bool>, // 某标题行是否处于折叠状态
-    pub line_hidden: Vec<bool>, // 因上级折叠而被隐藏的行
+    pub line_levels: Vec<u8>,   // 0=普通行, 1..=6=MD标题级别, 7=代码块起始行
+    pub line_folded: Vec<bool>, // 某标题或代码块行是否已折叠
+    pub line_hidden: Vec<bool>, // 被上级折叠隐藏的行
     pub wrap_patches: Vec<(usize, usize, usize)>,
     pub cursors: Vec<Cursor>,
     undo_stack: VecDeque<UndoEntry>,
@@ -527,7 +601,7 @@ impl Document {
             self.line_states[l] = st;
             let (lvl, next_st) = {
                 let line = self.line_str(l);
-                (detect_heading_level(line, st), advance_md_line_state(st, line))
+                (detect_fold_level(line, st), advance_md_line_state(st, line))
             };
             self.line_levels[l] = lvl;
             st = next_st;
@@ -547,7 +621,7 @@ impl Document {
             self.line_states[l] = st;
             let (lvl, next_st) = {
                 let line = self.line_str(l);
-                (detect_heading_level(line, st), advance_md_line_state(st, line))
+                (detect_fold_level(line, st), advance_md_line_state(st, line))
             };
             self.line_levels[l] = lvl;
             st = next_st;
@@ -557,25 +631,46 @@ impl Document {
         }
     }
 
+    #[inline]
+    fn is_closing_fence_line(&self, line: usize) -> bool {
+        let count = self.line_count();
+        matches!(self.line_states.get(line), Some(LineState::FencedCode { .. }))
+            && (line + 1 >= count || matches!(self.line_states.get(line + 1), Some(LineState::Normal)))
+    }
+
     pub fn recompute_hidden_lines(&mut self) {
         let count = self.line_starts.len();
         if self.line_hidden.len() != count {
             self.line_hidden.resize(count, false);
         }
-        let mut fold_level: Option<u8> = None;
+        let mut active: Option<ActiveFold> = None;
         for l in 0..count {
             let lvl = self.line_levels.get(l).copied().unwrap_or(0);
-            if let Some(fl) = fold_level {
-                if lvl > 0 && lvl <= fl {
-                    fold_level = None;
-                } else {
+            match active {
+                Some(ActiveFold::Heading(fl)) => {
+                    if (1..=6).contains(&lvl) && lvl <= fl {
+                        active = None;
+                    } else {
+                        self.line_hidden[l] = true;
+                        continue;
+                    }
+                }
+                Some(ActiveFold::CodeBlock) => {
                     self.line_hidden[l] = true;
+                    if self.is_closing_fence_line(l) {
+                        active = None;
+                    }
                     continue;
                 }
+                None => {}
             }
             self.line_hidden[l] = false;
-            if lvl > 0 && self.line_folded.get(l).copied().unwrap_or(false) {
-                fold_level = Some(lvl);
+            if self.line_folded.get(l).copied().unwrap_or(false) {
+                if (1..=6).contains(&lvl) {
+                    active = Some(ActiveFold::Heading(lvl));
+                } else if lvl == 7 {
+                    active = Some(ActiveFold::CodeBlock);
+                }
             }
         }
     }
@@ -591,9 +686,12 @@ impl Document {
 
     pub fn set_all_folds(&mut self, folded: bool) {
         for l in 0..self.line_folded.len() {
-            if self.line_levels.get(l).copied().unwrap_or(0) > 0 {
+            let lvl = self.line_levels.get(l).copied().unwrap_or(0);
+            if (1..=6).contains(&lvl) {
                 self.line_folded[l] = folded;
-            } else {
+            } else if !folded && lvl == 7 {
+                self.line_folded[l] = false;
+            } else if lvl == 0 {
                 self.line_folded[l] = false;
             }
         }
@@ -605,10 +703,16 @@ impl Document {
             return false;
         }
         let mut changed = false;
+        if let Some(cb) = self.code_block_range_at(target_line) {
+            if self.line_folded.get(cb.start_line).copied().unwrap_or(false) {
+                self.line_folded[cb.start_line] = false;
+                changed = true;
+            }
+        }
         let mut min_lvl = u8::MAX;
         for l in (0..target_line).rev() {
             let lvl = self.line_levels[l];
-            if lvl > 0 && lvl < min_lvl {
+            if (1..=6).contains(&lvl) && lvl < min_lvl {
                 if self.line_folded[l] {
                     self.line_folded[l] = false;
                     changed = true;
@@ -634,9 +738,18 @@ impl Document {
             return 0;
         }
         let mut cnt = 0usize;
+        if fl == 7 {
+            for l in (line + 1)..self.line_count() {
+                cnt += 1;
+                if self.is_closing_fence_line(l) {
+                    break;
+                }
+            }
+            return cnt;
+        }
         for l in (line + 1)..self.line_count() {
             let lvl = self.line_levels[l];
-            if lvl > 0 && lvl <= fl {
+            if (1..=6).contains(&lvl) && lvl <= fl {
                 break;
             }
             cnt += 1;
@@ -647,7 +760,8 @@ impl Document {
     pub fn heading_for_line(&self, line: usize) -> Option<usize> {
         let mut l = line.min(self.line_count().saturating_sub(1));
         loop {
-            if self.line_levels.get(l).copied().unwrap_or(0) > 0 {
+            let lvl = self.line_levels.get(l).copied().unwrap_or(0);
+            if (1..=6).contains(&lvl) {
                 return Some(l);
             }
             if l == 0 {
@@ -655,6 +769,238 @@ impl Document {
             }
             l -= 1;
         }
+    }
+
+    pub fn code_block_range_at(&self, line: usize) -> Option<CodeBlockRange> {
+        if self.lang != Lang::Markdown || line >= self.line_count() {
+            return None;
+        }
+        let st = self.line_states.get(line).copied().unwrap_or(LineState::Normal);
+        let start_line = match st {
+            LineState::Normal => {
+                if parse_fence_open(self.line_str(line)).is_some() {
+                    line
+                } else {
+                    return None;
+                }
+            }
+            LineState::FencedCode { .. } => {
+                let mut l = line;
+                loop {
+                    if l == 0 {
+                        break 0;
+                    }
+                    l -= 1;
+                    if matches!(self.line_states[l], LineState::Normal) {
+                        break l;
+                    }
+                }
+            }
+        };
+
+        let count = self.line_count();
+        let mut end_line = start_line;
+        let mut has_closing_fence = false;
+        for l in (start_line + 1)..count {
+            end_line = l;
+            if self.is_closing_fence_line(l) {
+                has_closing_fence = !matches!(self.line_states.get(l + 1), Some(LineState::FencedCode { .. }))
+                    && (l + 1 < count || matches!(advance_md_line_state(self.line_states[l], self.line_str(l)), LineState::Normal));
+                break;
+            }
+        }
+
+        let inner_start_byte = if start_line + 1 <= end_line && start_line + 1 < count {
+            self.line_starts[start_line + 1]
+        } else {
+            self.line_bounds(start_line).1
+        };
+        let inner_end_byte = if has_closing_fence {
+            if end_line > start_line + 1 {
+                self.line_bounds(end_line - 1).1
+            } else {
+                inner_start_byte
+            }
+        } else if end_line > start_line {
+            self.line_bounds(end_line).1
+        } else {
+            inner_start_byte
+        };
+
+        let bs = self.line_starts[start_line];
+        let be = self.line_bounds(end_line).1;
+        let (block_start_byte, block_end_byte) = if be < self.text.len() {
+            (bs, be + 1)
+        } else if bs > 0 {
+            (bs - 1, be)
+        } else {
+            (0, be)
+        };
+
+        Some(CodeBlockRange {
+            start_line,
+            end_line,
+            has_closing_fence,
+            inner_start_byte,
+            inner_end_byte: inner_end_byte.max(inner_start_byte),
+            block_start_byte,
+            block_end_byte,
+        })
+    }
+
+    pub fn code_block_text(&self, cb: CodeBlockRange) -> String {
+        if cb.inner_start_byte >= cb.inner_end_byte {
+            return String::new();
+        }
+        self.text[cb.inner_start_byte..cb.inner_end_byte].replace('\n', "\r\n")
+    }
+
+    pub fn code_block_full_text(&self, cb: CodeBlockRange) -> String {
+        let bs = self.line_starts[cb.start_line];
+        let be = self.line_bounds(cb.end_line).1;
+        self.text[bs..be].replace('\n', "\r\n")
+    }
+
+    pub fn delete_code_block(&mut self, cb: CodeBlockRange) {
+        let target = cb.block_start_byte.min(self.text.len());
+        self.apply_edits(
+            vec![(cb.block_start_byte, cb.block_end_byte, String::new())],
+            Some(vec![Cursor::collapsed(target)]),
+        );
+    }
+
+    pub fn transform_block_style(&mut self, style: MdBlockStyle) {
+        let (s, e) = self.primary().range();
+        let l1 = self.line_of_byte(s);
+        let l2 = self.line_of_byte(e);
+        let b_start = self.line_bounds(l1).0;
+        let b_end = self.line_bounds(l2).1;
+
+        if style == MdBlockStyle::CodeBlock {
+            let body = &self.text[b_start..b_end];
+            let rep = format!("```\n{}\n```", body);
+            let caret = b_start + 3;
+            self.apply_edits(vec![(b_start, b_end, rep)], Some(vec![Cursor::collapsed(caret)]));
+            return;
+        }
+
+        let toggle_back = if let MdBlockStyle::Heading(lvl) = style {
+            (l1..=l2).all(|l| self.line_levels.get(l).copied().unwrap_or(0) == lvl)
+        } else {
+            false
+        };
+
+        let mut out_lines = Vec::with_capacity(l2 - l1 + 1);
+        for (idx, l) in (l1..=l2).enumerate() {
+            let line = self.line_str(l);
+            let stripped = strip_md_block_prefix(line);
+            let next = if toggle_back || style == MdBlockStyle::Paragraph {
+                stripped.to_string()
+            } else {
+                match style {
+                    MdBlockStyle::Heading(lvl) => format!("{} {}", "#".repeat(lvl as usize), stripped),
+                    MdBlockStyle::BulletList => format!("- {}", stripped),
+                    MdBlockStyle::OrderedList => format!("{}. {}", idx + 1, stripped),
+                    MdBlockStyle::TaskList => format!("- [ ] {}", stripped),
+                    MdBlockStyle::Quote => format!("> {}", stripped),
+                    MdBlockStyle::Paragraph | MdBlockStyle::CodeBlock => stripped.to_string(),
+                }
+            };
+            out_lines.push(next);
+        }
+        let rep = out_lines.join("\n");
+        let caret = b_start + rep.len();
+        self.apply_edits(vec![(b_start, b_end, rep)], Some(vec![Cursor::collapsed(caret)]));
+    }
+
+    pub fn indent_lines(&mut self, indent: bool) {
+        let (s, e) = self.primary().range();
+        let l1 = self.line_of_byte(s);
+        let l2 = self.line_of_byte(e);
+        let mut edits = Vec::new();
+        for l in l1..=l2 {
+            let (ls, _) = self.line_bounds(l);
+            if indent {
+                edits.push((ls, ls, "    ".to_string()));
+            } else {
+                let line = self.line_str(l);
+                let lb = line.as_bytes();
+                if lb.first() == Some(&b'\t') {
+                    edits.push((ls, ls + 1, String::new()));
+                } else {
+                    let mut sp = 0usize;
+                    while sp < 4 && lb.get(sp) == Some(&b' ') {
+                        sp += 1;
+                    }
+                    if sp > 0 {
+                        edits.push((ls, ls + sp, String::new()));
+                    }
+                }
+            }
+        }
+        self.apply_edits(edits, None);
+    }
+
+    pub fn toggle_inline_wrap(&mut self, prefix: &str, suffix: &str, placeholder: &str) {
+        let (s, e) = self.primary().range();
+        if s < e {
+            let sel = &self.text[s..e];
+            if sel.starts_with(prefix) && sel.ends_with(suffix) && sel.len() >= prefix.len() + suffix.len() {
+                let inner = sel[prefix.len()..sel.len() - suffix.len()].to_string();
+                let ilen = inner.len();
+                self.apply_edits(vec![(s, e, inner)], Some(vec![Cursor { anchor: s, head: s + ilen }]));
+                return;
+            }
+            if s >= prefix.len()
+                && e + suffix.len() <= self.text.len()
+                && &self.text[s - prefix.len()..s] == prefix
+                && &self.text[e..e + suffix.len()] == suffix
+            {
+                let inner = sel.to_string();
+                let ilen = inner.len();
+                let ns = s - prefix.len();
+                self.apply_edits(
+                    vec![(ns, e + suffix.len(), inner)],
+                    Some(vec![Cursor { anchor: ns, head: ns + ilen }]),
+                );
+                return;
+            }
+            let wrapped = format!("{}{}{}", prefix, sel, suffix);
+            let inner_s = s + prefix.len();
+            let inner_e = inner_s + sel.len();
+            self.apply_edits(
+                vec![(s, e, wrapped)],
+                Some(vec![Cursor { anchor: inner_s, head: inner_e }]),
+            );
+        } else {
+            let wrapped = format!("{}{}{}", prefix, placeholder, suffix);
+            let inner_s = s + prefix.len();
+            let inner_e = inner_s + placeholder.len();
+            self.apply_edits(
+                vec![(s, e, wrapped)],
+                Some(vec![Cursor { anchor: inner_s, head: inner_e }]),
+            );
+        }
+    }
+
+    pub fn insert_md_snippet(&mut self, snippet: &str, caret_off: usize, sel_len: usize, ensure_new_line: bool) {
+        let (s, e) = self.primary().range();
+        let prefix_nl = if ensure_new_line {
+            let line = self.line_of_byte(s);
+            let (ls, _) = self.line_bounds(line);
+            if s > ls && !self.text[ls..s].trim().is_empty() {
+                "\n"
+            } else {
+                ""
+            }
+        } else {
+            ""
+        };
+        let full = format!("{}{}", prefix_nl, snippet);
+        let base = s + prefix_nl.len();
+        let anchor = (base + caret_off).min(s + full.len());
+        let head = (anchor + sel_len).min(s + full.len());
+        self.apply_edits(vec![(s, e, full)], Some(vec![Cursor { anchor, head }]));
     }
 
     pub fn set_content(
@@ -1107,7 +1453,7 @@ impl Document {
 }
 
 // ============================================================================
-// 5. 查找与正则替换引擎（支持 multi_line ^/$、$1/${1}/\1 捕获组及 \n/\t 转义）
+// 5. 查找与正则替换引擎
 // ============================================================================
 
 fn expand_regex_template(template: &str, caps: &Captures<'_>) -> String {
@@ -1360,7 +1706,7 @@ impl SearchState {
 }
 
 // ============================================================================
-// 6. Markdown / GFM 与多语言可见行语法高亮引擎（O(N) + UTF-8 安全步进）
+// 6. Markdown / GFM 与多语言可见行语法高亮引擎
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1977,7 +2323,7 @@ pub fn highlight_line_with_state(
 }
 
 // ============================================================================
-// 7. Markdown 大纲解析器（非实时按需刷新 + 主次级别折叠）
+// 7. Markdown 大纲解析器
 // ============================================================================
 
 #[derive(Clone)]
