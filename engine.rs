@@ -9,6 +9,7 @@ use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, CW_USEDEFAULT, MB_ICONERROR, MB_OK};
@@ -37,10 +38,11 @@ pub fn floor_char_boundary(s: &str, pos: usize) -> usize {
 }
 
 // ============================================================================
-// 1. 启动期错误日志与崩溃捕获
+// 1. 可控开关的启动日志与崩溃捕获
 // ============================================================================
 
 static LOG_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
+static LOG_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn exe_dir() -> PathBuf {
     std::env::current_exe()
@@ -49,18 +51,36 @@ pub fn exe_dir() -> PathBuf {
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
-pub fn init_logger() {
-    let base = exe_dir();
-    let candidate = base.join("app.log");
-    let chosen = if OpenOptions::new().create(true).append(true).open(&candidate).is_ok() {
-        candidate
-    } else {
-        std::env::temp_dir().join("NotepadLite_startup.log")
-    };
+fn ensure_log_path() -> Option<PathBuf> {
     if let Ok(mut guard) = LOG_PATH.lock() {
-        *guard = Some(chosen);
+        if let Some(p) = guard.as_ref() {
+            return Some(p.clone());
+        }
+        let candidate = exe_dir().join("app.log");
+        let chosen = if OpenOptions::new().create(true).append(true).open(&candidate).is_ok() {
+            candidate
+        } else {
+            std::env::temp_dir().join("NotepadLite_startup.log")
+        };
+        *guard = Some(chosen.clone());
+        return Some(chosen);
     }
-    log_msg("INFO", "=== NotepadLite starting ===");
+    None
+}
+
+pub fn set_log_enabled(enabled: bool) {
+    LOG_ENABLED.store(enabled, Ordering::Relaxed);
+    if enabled {
+        log_msg("INFO", "日志记录已启用");
+    }
+}
+
+pub fn init_logger(enabled: bool) {
+    LOG_ENABLED.store(enabled, Ordering::Relaxed);
+    if enabled {
+        let _ = ensure_log_path();
+        log_msg("INFO", "=== NotepadLite starting ===");
+    }
 
     std::panic::set_hook(Box::new(|info| {
         let loc = info
@@ -69,22 +89,26 @@ pub fn init_logger() {
             .unwrap_or_else(|| "unknown".into());
         let msg = format!("PANIC at [{}]: {}", loc, info);
         log_msg("FATAL", &msg);
-        show_fatal_box(
-            "NotepadLite 启动/运行致命错误",
-            &format!("{}\n\n详细信息已写入同级目录 app.log", msg),
-        );
+        let hint = if LOG_ENABLED.load(Ordering::Relaxed) {
+            "\n\n详细信息已写入同级目录 app.log"
+        } else {
+            "\n\n可在「视图 -> 启用运行日志」开启日志记录以协助排查"
+        };
+        show_fatal_box("NotepadLite 启动/运行致命错误", &format!("{}{}", msg, hint));
     }));
 }
 
 pub fn log_msg(level: &str, msg: &str) {
+    if !LOG_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(path) = ensure_log_path() else {
+        return;
+    };
     let ts = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
     let line = format!("[{}] [{}] {}\r\n", ts, level, msg);
-    if let Ok(guard) = LOG_PATH.lock() {
-        if let Some(path) = guard.as_ref() {
-            if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
-                let _ = f.write_all(line.as_bytes());
-            }
-        }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
     }
 }
 
@@ -97,7 +121,7 @@ pub fn show_fatal_box(title: &str, msg: &str) {
 }
 
 // ============================================================================
-// 2. 绿色便携配置（exe 同级目录 config.json）
+// 2. 绿色便携配置与便携附件目录（files/）管理
 // ============================================================================
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -117,6 +141,7 @@ pub struct AppConfig {
     pub show_line_numbers: bool,
     pub show_whitespace: bool,
     pub always_on_top: bool,
+    pub enable_log: bool,
     pub outline_visible: bool,
     pub outline_width: i32,
     pub outline_floating: bool,
@@ -144,6 +169,7 @@ impl Default for AppConfig {
             show_line_numbers: false,
             show_whitespace: false,
             always_on_top: false,
+            enable_log: false,
             outline_visible: false,
             outline_width: 245,
             outline_floating: false,
@@ -169,10 +195,7 @@ pub fn load_config() -> AppConfig {
     }
     match fs::read_to_string(&path) {
         Ok(s) => {
-            let mut cfg = serde_json::from_str::<AppConfig>(&s).unwrap_or_else(|e| {
-                log_msg("WARN", &format!("config.json parse error, using default: {}", e));
-                AppConfig::default()
-            });
+            let mut cfg = serde_json::from_str::<AppConfig>(&s).unwrap_or_else(|_| AppConfig::default());
             if cfg.config_version < CURRENT_CONFIG_VERSION {
                 cfg.config_version = CURRENT_CONFIG_VERSION;
                 cfg.word_wrap = true;
@@ -182,23 +205,114 @@ pub fn load_config() -> AppConfig {
             }
             cfg
         }
-        Err(e) => {
-            log_msg("WARN", &format!("config.json read error: {}", e));
-            AppConfig::default()
-        }
+        Err(_) => AppConfig::default(),
     }
 }
 
 pub fn save_config(cfg: &AppConfig) {
     let path = config_path();
-    match serde_json::to_string_pretty(cfg) {
-        Ok(json) => {
-            if let Err(e) = fs::write(&path, json) {
-                log_msg("ERROR", &format!("save config.json failed: {}", e));
+    if let Ok(json) = serde_json::to_string_pretty(cfg) {
+        if let Err(e) = fs::write(&path, json) {
+            log_msg("ERROR", &format!("save config.json failed: {}", e));
+        }
+    }
+}
+
+pub fn is_image_ext(path_or_name: &str) -> bool {
+    let ext = Path::new(path_or_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "bmp" | "webp" | "svg" | "ico")
+}
+
+pub fn copy_to_portable_files_dir(src: &Path) -> Result<String, String> {
+    let files_dir = exe_dir().join("files");
+    fs::create_dir_all(&files_dir).map_err(|e| format!("创建附件目录 files 失败: {}", e))?;
+
+    let orig_name = src
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| "无效的文件名".to_string())?;
+
+    if let (Ok(c_src_dir), Ok(c_files_dir)) = (
+        src.parent().unwrap_or_else(|| Path::new("")).canonicalize(),
+        files_dir.canonicalize(),
+    ) {
+        if c_src_dir == c_files_dir {
+            return Ok(orig_name.to_string());
+        }
+    }
+
+    let stem = src.file_stem().and_then(|s| s.to_str()).unwrap_or("attachment");
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("");
+
+    let mut chosen_name = orig_name.to_string();
+    let mut dst = files_dir.join(&chosen_name);
+    let mut idx = 1usize;
+    while dst.exists() {
+        chosen_name = if ext.is_empty() {
+            format!("{}_{}", stem, idx)
+        } else {
+            format!("{}_{}.{}", stem, idx, ext)
+        };
+        dst = files_dir.join(&chosen_name);
+        idx += 1;
+    }
+
+    fs::copy(src, &dst).map_err(|e| format!("复制附件到 files 目录失败: {}", e))?;
+    Ok(chosen_name)
+}
+
+pub fn format_md_attachment_snippet(filename: &str) -> String {
+    let encoded_url = filename.replace(' ', "%20");
+    if is_image_ext(filename) {
+        format!("![{}](files/{})", filename, encoded_url)
+    } else {
+        format!("[{}](files/{})", filename, encoded_url)
+    }
+}
+
+pub fn percent_decode_utf8(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push(((h << 4) | l) as u8);
+                i += 3;
+                continue;
             }
         }
-        Err(e) => log_msg("ERROR", &format!("serialize config failed: {}", e)),
+        out.push(bytes[i]);
+        i += 1;
     }
+    String::from_utf8(out).unwrap_or_else(|_| input.replace("%20", " "))
+}
+
+pub fn resolve_attachment_path(target: &str, doc_path: Option<&Path>) -> Option<PathBuf> {
+    let clean = percent_decode_utf8(target.trim());
+    let rel = clean.trim_start_matches("./").replace('/', "\\");
+    let exe_cand = exe_dir().join(&rel);
+    if exe_cand.exists() {
+        return Some(exe_cand);
+    }
+    if let Some(dp) = doc_path.and_then(|p| p.parent()) {
+        let doc_cand = dp.join(&rel);
+        if doc_cand.exists() {
+            return Some(doc_cand);
+        }
+    }
+    let direct = PathBuf::from(&clean);
+    if direct.exists() {
+        return Some(direct);
+    }
+    None
 }
 
 // ============================================================================
@@ -376,7 +490,7 @@ pub fn save_file_with_encoding(
 }
 
 // ============================================================================
-// 4. 高性能文本缓冲、标题/代码块折叠、MD编辑操作与撤销重做引擎
+// 4. 高性能文本缓冲、标题/代码块折叠、链接/附件识别与编辑引擎
 // ============================================================================
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -426,6 +540,15 @@ pub struct CodeBlockRange {
     pub block_end_byte: usize,
 }
 
+#[derive(Clone)]
+pub struct MdLinkSpan {
+    pub label: String,
+    pub target: String,
+    pub is_image: bool,
+    pub start: usize,
+    pub end: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum MdBlockStyle {
     Paragraph,
@@ -442,7 +565,7 @@ fn detect_fold_level(line: &str, state: LineState) -> u8 {
         return 0;
     }
     if parse_fence_open(line).is_some() {
-        return 7; // 7 表示围栏代码块起始行（可独立折叠）
+        return 7;
     }
     let trimmed = line.trim_start();
     let ws = line.len() - trimmed.len();
@@ -466,7 +589,6 @@ fn strip_md_block_prefix(line: &str) -> &str {
     if b.is_empty() {
         return "";
     }
-    // 剥离标题 #..######
     if b[0] == b'#' {
         let mut h = 0;
         while h < b.len() && b[h] == b'#' {
@@ -476,12 +598,10 @@ fn strip_md_block_prefix(line: &str) -> &str {
             return trimmed[h..].trim_start();
         }
     }
-    // 剥离引用 >
     if b[0] == b'>' {
         let rest = &trimmed[1..];
         return rest.strip_prefix(' ').unwrap_or(rest);
     }
-    // 剥离任务列表与无序列表
     if matches!(b[0], b'-' | b'*' | b'+') && b.get(1).copied().is_some_and(|c| c == b' ' || c == b'\t') {
         let after = trimmed[2..].trim_start();
         if after.starts_with("[ ] ") || after.starts_with("[x] ") || after.starts_with("[X] ") {
@@ -492,7 +612,6 @@ fn strip_md_block_prefix(line: &str) -> &str {
         }
         return after;
     }
-    // 剥离有序列表 1. / 1)
     let mut d = 0usize;
     while d < b.len() && b[d].is_ascii_digit() && d < 9 {
         d += 1;
@@ -501,6 +620,57 @@ fn strip_md_block_prefix(line: &str) -> &str {
         return trimmed[d + 2..].trim_start();
     }
     trimmed
+}
+
+pub fn extract_links_in_line(line: &str) -> Vec<MdLinkSpan> {
+    let mut out = Vec::new();
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    if len == 0 || len > 8192 {
+        return out;
+    }
+    let mut i = 0usize;
+    while i < len {
+        let b = bytes[i];
+        if (b == b'!' && i + 1 < len && bytes[i + 1] == b'[') || b == b'[' {
+            let is_img = b == b'!';
+            let lb = if is_img { i + 1 } else { i };
+            if let Some(rb_rel) = line[lb + 1..].find(']') {
+                let rb = lb + 1 + rb_rel;
+                if rb + 1 < len && bytes[rb + 1] == b'(' {
+                    if let Some(rp_rel) = line[rb + 2..].find(')') {
+                        let rp = rb + 2 + rp_rel + 1;
+                        let label = line[lb + 1..rb].to_string();
+                        let target = line[rb + 2..rp - 1].trim().to_string();
+                        if !target.is_empty() {
+                            out.push(MdLinkSpan { label, target, is_image: is_img, start: i, end: rp });
+                        }
+                        i = rp;
+                        continue;
+                    }
+                }
+            }
+        }
+        if b == b'<' {
+            if let Some(gt_rel) = line[i + 1..].find('>') {
+                let inner = &line[i + 1..i + 1 + gt_rel];
+                if inner.starts_with("http://") || inner.starts_with("https://") {
+                    let end = i + 1 + gt_rel + 1;
+                    out.push(MdLinkSpan {
+                        label: inner.to_string(),
+                        target: inner.to_string(),
+                        is_image: false,
+                        start: i,
+                        end,
+                    });
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        i = next_char_step(line, i, len);
+    }
+    out
 }
 
 #[derive(Clone, Copy)]
@@ -513,9 +683,9 @@ pub struct Document {
     pub text: String,
     pub line_starts: Vec<usize>,
     pub line_states: Vec<LineState>,
-    pub line_levels: Vec<u8>,   // 0=普通行, 1..=6=MD标题级别, 7=代码块起始行
-    pub line_folded: Vec<bool>, // 某标题或代码块行是否已折叠
-    pub line_hidden: Vec<bool>, // 被上级折叠隐藏的行
+    pub line_levels: Vec<u8>,
+    pub line_folded: Vec<bool>,
+    pub line_hidden: Vec<bool>,
     pub wrap_patches: Vec<(usize, usize, usize)>,
     pub cursors: Vec<Cursor>,
     undo_stack: VecDeque<UndoEntry>,
@@ -564,6 +734,22 @@ impl Document {
 
     pub fn has_any_selection(&self) -> bool {
         self.cursors.iter().any(|c| c.has_selection())
+    }
+
+    pub fn link_at_byte(&self, byte_pos: usize) -> Option<MdLinkSpan> {
+        let line = self.line_of_byte(byte_pos);
+        let ls = self.line_starts.get(line).copied().unwrap_or(0);
+        let rel = byte_pos.saturating_sub(ls);
+        extract_links_in_line(self.line_str(line))
+            .into_iter()
+            .find(|lk| rel >= lk.start && rel <= lk.end)
+    }
+
+    pub fn first_link_on_line(&self, line: usize) -> Option<MdLinkSpan> {
+        if line >= self.line_count() {
+            return None;
+        }
+        extract_links_in_line(self.line_str(line)).into_iter().next()
     }
 
     pub fn rebuild_line_index(&mut self) {
@@ -805,7 +991,8 @@ impl Document {
             end_line = l;
             if self.is_closing_fence_line(l) {
                 has_closing_fence = !matches!(self.line_states.get(l + 1), Some(LineState::FencedCode { .. }))
-                    && (l + 1 < count || matches!(advance_md_line_state(self.line_states[l], self.line_str(l)), LineState::Normal));
+                    && (l + 1 < count
+                        || matches!(advance_md_line_state(self.line_states[l], self.line_str(l)), LineState::Normal));
                 break;
             }
         }
@@ -951,11 +1138,7 @@ impl Document {
                 self.apply_edits(vec![(s, e, inner)], Some(vec![Cursor { anchor: s, head: s + ilen }]));
                 return;
             }
-            if s >= prefix.len()
-                && e + suffix.len() <= self.text.len()
-                && &self.text[s - prefix.len()..s] == prefix
-                && &self.text[e..e + suffix.len()] == suffix
-            {
+            if self.text[..s].ends_with(prefix) && self.text[e..].starts_with(suffix) {
                 let inner = sel.to_string();
                 let ilen = inner.len();
                 let ns = s - prefix.len();
@@ -998,8 +1181,8 @@ impl Document {
         };
         let full = format!("{}{}", prefix_nl, snippet);
         let base = s + prefix_nl.len();
-        let anchor = (base + caret_off).min(s + full.len());
-        let head = (anchor + sel_len).min(s + full.len());
+        let anchor = floor_char_boundary(&full, (base + caret_off - s).min(full.len())) + s;
+        let head = floor_char_boundary(&full, (anchor - s + sel_len).min(full.len())) + s;
         self.apply_edits(vec![(s, e, full)], Some(vec![Cursor { anchor, head }]));
     }
 
@@ -1503,11 +1686,7 @@ fn expand_regex_template(template: &str, caps: &Captures<'_>) -> String {
         } else if b[i] == b'\\' && i + 1 < b.len() {
             let next = b[i + 1];
             match next {
-                b'n' => {
-                    out.push('\n');
-                    i += 2;
-                    continue;
-                }
+                b'n' => { out.push('\n'); i += 2; continue; }
                 b'r' => {
                     if i + 3 < b.len() && b[i + 2] == b'\\' && b[i + 3] == b'n' {
                         out.push('\n');
@@ -1518,16 +1697,8 @@ fn expand_regex_template(template: &str, caps: &Captures<'_>) -> String {
                     }
                     continue;
                 }
-                b't' => {
-                    out.push('\t');
-                    i += 2;
-                    continue;
-                }
-                b'\\' => {
-                    out.push('\\');
-                    i += 2;
-                    continue;
-                }
+                b't' => { out.push('\t'); i += 2; continue; }
+                b'\\' => { out.push('\\'); i += 2; continue; }
                 b'0'..=b'9' => {
                     let idx = (next - b'0') as usize;
                     if let Some(m) = caps.get(idx) {
@@ -1742,6 +1913,7 @@ pub enum TokenKind {
     Comment,
     Number,
     Accent,
+    Attachment,
     Bold,
     Italic,
     Strike,
@@ -2086,15 +2258,24 @@ fn scan_inline_md(
         }
 
         if (b == b'!' && i + 1 < to && bytes[i + 1] == b'[') || b == b'[' {
-            let lb = if b == b'!' { i + 1 } else { i };
+            let is_img = b == b'!';
+            let lb = if is_img { i + 1 } else { i };
             if lb + 1 < look_end {
                 if let Some(rb_rel) = line[lb + 1..look_end].find(']') {
                     let rb = lb + 1 + rb_rel;
                     if rb + 1 < look_end && bytes[rb + 1] == b'(' {
                         if let Some(rp_rel) = line[rb + 2..look_end].find(')') {
                             let rp = rb + 2 + rp_rel + 1;
+                            let target = line[rb + 2..rp - 1].trim();
+                            let is_attach = is_img
+                                || target.starts_with("files/")
+                                || target.starts_with("./files/");
                             flush_plain(plain_start, i, out);
-                            out.push((i, rb + 1, TokenKind::Accent));
+                            out.push((
+                                i,
+                                rb + 1,
+                                if is_attach { TokenKind::Attachment } else { TokenKind::Accent },
+                            ));
                             out.push((rb + 1, rp, TokenKind::StringLit));
                             i = rp;
                             plain_start = i;
