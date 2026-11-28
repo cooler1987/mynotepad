@@ -15,12 +15,13 @@ use windows_sys::Win32::UI::Controls::Dialogs::*;
 use windows_sys::Win32::UI::Controls::{BST_CHECKED, EM_SETSEL};
 use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, SetFocus, VK_ESCAPE, VK_RETURN, VK_SHIFT, VK_TAB};
-use windows_sys::Win32::UI::Shell::DragAcceptFiles;
+use windows_sys::Win32::UI::Shell::{DragAcceptFiles, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use engine::{
-    from_wide_slice, init_logger, load_config, log_msg, normalize_newlines_fast, save_config,
-    show_fatal_box, to_wide, Cursor, Document, OutlineState, SearchState,
+    exe_dir, from_wide_slice, init_logger, load_config, log_msg, normalize_newlines_fast,
+    resolve_attachment_path, save_config, show_fatal_box, to_wide, Cursor, Document, OutlineState,
+    SearchState,
 };
 use render::{apply_titlebar_theme, get_theme};
 use ui::{main_wnd_proc, AppState};
@@ -74,6 +75,7 @@ pub const IDM_VIEW_OUTLINE_FLOAT: usize = 4022;
 pub const IDM_VIEW_FOLD_TOGGLE: usize = 4023;
 pub const IDM_VIEW_FOLD_ALL: usize = 4024;
 pub const IDM_VIEW_UNFOLD_ALL: usize = 4025;
+pub const IDM_VIEW_LOG: usize = 4026;
 
 pub const IDM_EOL_CRLF: usize = 5201;
 pub const IDM_EOL_LF: usize = 5202;
@@ -100,7 +102,7 @@ pub const IDM_MD_FMT_CODE: usize = 7103;
 pub const IDM_MD_FMT_STRIKE: usize = 7104;
 pub const IDM_MD_FMT_LINK: usize = 7105;
 
-// Markdown 插入模板命令 ID
+// Markdown 插入模板与附件命令 ID
 pub const IDM_MD_INS_H1: usize = 7201;
 pub const IDM_MD_INS_H2: usize = 7202;
 pub const IDM_MD_INS_H3: usize = 7203;
@@ -120,13 +122,15 @@ pub const IDM_MD_INS_WARNING: usize = 7216;
 pub const IDM_MD_INS_CAUTION: usize = 7217;
 pub const IDM_MD_INS_LINK: usize = 7218;
 pub const IDM_MD_INS_FORMULA: usize = 7219;
-pub const IDM_MD_INS_IMAGE: usize = 7220;
+pub const IDM_MD_INS_ATTACH: usize = 7220;
 
-// 代码块专项操作命令 ID
+// 代码块与附件专项操作命令 ID
 pub const IDM_MD_CB_COPY_INNER: usize = 7301;
 pub const IDM_MD_CB_COPY_FULL: usize = 7302;
 pub const IDM_MD_CB_DELETE: usize = 7303;
 pub const IDM_MD_CB_FOLD_TOGGLE: usize = 7304;
+pub const IDM_MD_OPEN_ATTACH: usize = 7305;
+pub const IDM_MD_OPEN_ATTACH_DIR: usize = 7306;
 
 pub const FIND_PANEL_W: i32 = 430;
 pub const FIND_PANEL_H: i32 = 108;
@@ -163,7 +167,7 @@ fn is_key_down(vk: u16) -> bool {
 }
 
 // ============================================================================
-// 1. 剪贴板与系统文件/字体对话框
+// 1. 剪贴板、系统文件/附件/字体对话框与系统程序调用
 // ============================================================================
 
 pub fn clipboard_copy(hwnd: HWND, text: &str) {
@@ -228,6 +232,28 @@ pub fn dialog_open_file(hwnd: HWND) -> Option<PathBuf> {
         ofn.lpstrFile = buf.as_mut_ptr();
         ofn.nMaxFile = buf.len() as u32;
         ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY;
+        if GetOpenFileNameW(&mut ofn) != 0 {
+            return Some(PathBuf::from(from_wide_slice(&buf)));
+        }
+    }
+    None
+}
+
+pub fn dialog_open_attachment(hwnd: HWND) -> Option<PathBuf> {
+    let mut buf = vec![0u16; 4096];
+    let filter: Vec<u16> = "所有文件 (*.*)\0*.*\0图片文件 (*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.svg)\0*.png;*.jpg;*.jpeg;*.gif;*.bmp;*.webp;*.svg\0音视频文件 (*.mp3;*.wav;*.flac;*.m4a;*.mp4;*.mkv;*.avi;*.mov)\0*.mp3;*.wav;*.flac;*.m4a;*.mp4;*.mkv;*.avi;*.mov\0\0"
+        .encode_utf16()
+        .collect();
+    let title = to_wide("选择要插入的图片或附件");
+    unsafe {
+        let mut ofn: OPENFILENAMEW = std::mem::zeroed();
+        ofn.lStructSize = std::mem::size_of::<OPENFILENAMEW>() as u32;
+        ofn.hwndOwner = hwnd;
+        ofn.lpstrFilter = filter.as_ptr();
+        ofn.lpstrTitle = title.as_ptr();
+        ofn.lpstrFile = buf.as_mut_ptr();
+        ofn.nMaxFile = buf.len() as u32;
+        ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_HIDEREADONLY | OFN_NOCHANGEDIR;
         if GetOpenFileNameW(&mut ofn) != 0 {
             return Some(PathBuf::from(from_wide_slice(&buf)));
         }
@@ -300,6 +326,50 @@ pub fn dialog_choose_font(state: &mut AppState) {
             state.recreate_fonts();
             save_config(&state.cfg);
             state.invalidate();
+        }
+    }
+}
+
+pub fn shell_open_target(hwnd: HWND, target: &str, doc_path: Option<&Path>) {
+    let op = to_wide("open");
+    let lower = target.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:") {
+        let w = to_wide(target);
+        unsafe {
+            ShellExecuteW(hwnd, op.as_ptr(), w.as_ptr(), null(), null(), SW_SHOWNORMAL);
+        }
+        return;
+    }
+    if let Some(full) = resolve_attachment_path(target, doc_path) {
+        let w = to_wide(&full.to_string_lossy());
+        let res = unsafe {
+            ShellExecuteW(hwnd, op.as_ptr(), w.as_ptr(), null(), null(), SW_SHOWNORMAL) as isize
+        };
+        if res <= 32 {
+            show_fatal_box("打开附件失败", &format!("系统未能打开文件 (错误码 {}):\n{}", res, full.display()));
+        }
+    } else {
+        show_fatal_box("找不到附件文件", &format!("未能找到对应图片或附件:\n{}", target));
+    }
+}
+
+pub fn shell_reveal_attachment_dir(hwnd: HWND, target: &str, doc_path: Option<&Path>) {
+    let op = to_wide("open");
+    if let Some(full) = resolve_attachment_path(target, doc_path) {
+        let explorer = to_wide("explorer.exe");
+        let args = to_wide(&format!("/select,\"{}\"", full.display()));
+        unsafe {
+            ShellExecuteW(hwnd, op.as_ptr(), explorer.as_ptr(), args.as_ptr(), null(), SW_SHOWNORMAL);
+        }
+    } else {
+        let dir = exe_dir().join("files");
+        if dir.exists() {
+            let w = to_wide(&dir.to_string_lossy());
+            unsafe {
+                ShellExecuteW(hwnd, op.as_ptr(), w.as_ptr(), null(), null(), SW_SHOWNORMAL);
+            }
+        } else {
+            show_fatal_box("目录不存在", "尚未创建 files 附件目录，请先插入图片或附件。");
         }
     }
 }
@@ -720,6 +790,8 @@ pub fn build_main_menu() -> (HMENU, HMENU) {
         add(m_edit, IDM_EDIT_DELETE, "删除(&D)\tDel");
         add(m_edit, IDM_EDIT_SELECT_ALL, "全选(&A)\tCtrl+A");
         AppendMenuW(m_edit, MF_SEPARATOR, 0, null());
+        add(m_edit, IDM_MD_INS_ATTACH, "插入图片 / 附件(&M)...");
+        AppendMenuW(m_edit, MF_SEPARATOR, 0, null());
         add(m_edit, IDM_EDIT_DUP_LINE, "复制当前行\tCtrl+D");
         add(m_edit, IDM_EDIT_DEL_LINE, "删除当前行\tCtrl+Shift+K");
         add(m_edit, IDM_EDIT_MOVE_UP, "上移当前行\tAlt+Up");
@@ -756,6 +828,7 @@ pub fn build_main_menu() -> (HMENU, HMENU) {
         add(m_view, IDM_VIEW_THEME_LIGHT, "浅色主题 (Light)");
         add(m_view, IDM_VIEW_FONT, "字体与字号设置(&F)...");
         add(m_view, IDM_VIEW_TOPMOST, "窗口置顶(&A)");
+        add(m_view, IDM_VIEW_LOG, "启用运行日志 (app.log)");
         AppendMenuW(m_view, MF_SEPARATOR, 0, null());
         add(m_view, IDM_VIEW_ZOOM_IN, "放大字体\tCtrl++");
         add(m_view, IDM_VIEW_ZOOM_OUT, "缩小字体\tCtrl+-");
@@ -772,12 +845,12 @@ pub fn build_main_menu() -> (HMENU, HMENU) {
 }
 
 fn main() {
-    init_logger();
+    let cfg = load_config();
+    init_logger(cfg.enable_log);
 
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let hinst = GetModuleHandleW(null());
-        let cfg = load_config();
 
         let cls_name = to_wide("NotepadLiteMainWindow");
         let wc = WNDCLASSEXW {
