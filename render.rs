@@ -26,6 +26,7 @@ pub struct Theme {
     pub search_line_bg: u32,
     pub code_block_bg: u32,
     pub inline_code_bg: u32,
+    pub attach_bg: u32,
     pub sel_bg: u32,
     pub match_bg: u32,
     pub cur_match_bg: u32,
@@ -53,6 +54,7 @@ pub struct Theme {
     pub cmt_fg: u32,
     pub num_fg: u32,
     pub acc_fg: u32,
+    pub attach_fg: u32,
     pub bold_fg: u32,
     pub italic_fg: u32,
     pub strike_fg: u32,
@@ -76,6 +78,7 @@ pub fn get_theme(dark: bool) -> Theme {
             search_line_bg: rgb(56, 50, 30),
             code_block_bg: rgb(46, 42, 28),
             inline_code_bg: rgb(58, 52, 34),
+            attach_bg: rgb(34, 62, 56),
             sel_bg: rgb(38, 79, 120),
             match_bg: rgb(95, 75, 28),
             cur_match_bg: rgb(195, 130, 30),
@@ -103,6 +106,7 @@ pub fn get_theme(dark: bool) -> Theme {
             cmt_fg: rgb(128, 168, 112),
             num_fg: rgb(181, 206, 168),
             acc_fg: rgb(140, 200, 245),
+            attach_fg: rgb(86, 214, 182),
             bold_fg: rgb(229, 192, 123),
             italic_fg: rgb(198, 170, 221),
             strike_fg: rgb(135, 135, 135),
@@ -120,6 +124,7 @@ pub fn get_theme(dark: bool) -> Theme {
             search_line_bg: rgb(255, 246, 188),
             code_block_bg: rgb(253, 249, 224),
             inline_code_bg: rgb(250, 242, 202),
+            attach_bg: rgb(224, 245, 236),
             sel_bg: rgb(173, 214, 255),
             match_bg: rgb(255, 236, 140),
             cur_match_bg: rgb(255, 172, 45),
@@ -147,6 +152,7 @@ pub fn get_theme(dark: bool) -> Theme {
             cmt_fg: rgb(87, 122, 92),
             num_fg: rgb(9, 134, 88),
             acc_fg: rgb(4, 81, 165),
+            attach_fg: rgb(0, 122, 92),
             bold_fg: rgb(149, 56, 0),
             italic_fg: rgb(130, 80, 223),
             strike_fg: rgb(145, 150, 158),
@@ -615,6 +621,7 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
         let search_line_br = CreateSolidBrush(theme.search_line_bg);
         let code_blk_br = CreateSolidBrush(theme.code_block_bg);
         let inline_code_br = CreateSolidBrush(theme.inline_code_bg);
+        let attach_br = CreateSolidBrush(theme.attach_bg);
         let quote_bar_br = CreateSolidBrush(theme.acc_fg);
         let sel_br = CreateSolidBrush(theme.sel_bg);
         let match_br = CreateSolidBrush(theme.match_bg);
@@ -773,7 +780,7 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
             let mut cur_x = text_left;
             let mut cur_col = 0usize;
             let mut pos = 0usize;
-            let draw_chunk = |chunk: &str, color: u32, font: HFONT, inline_bg: bool, x_acc: &mut i32, col_acc: &mut usize| {
+            let draw_chunk = |chunk: &str, color: u32, font: HFONT, bg_br: HBRUSH, x_acc: &mut i32, col_acc: &mut usize| {
                 if chunk.is_empty() {
                     return;
                 }
@@ -784,9 +791,9 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
                 SelectObject(mem_dc, font as _);
                 let mut sz: SIZE = std::mem::zeroed();
                 GetTextExtentPoint32W(mem_dc, wtxt.as_ptr(), clen, &mut sz);
-                if inline_bg {
+                if !bg_br.is_null() {
                     let irc = RECT { left: *x_acc, top: y + 2, right: *x_acc + sz.cx, bottom: y + state.line_h - 2 };
-                    FillRect(mem_dc, &irc, inline_code_br);
+                    FillRect(mem_dc, &irc, bg_br);
                 }
                 if state.cfg.show_whitespace && chunk.chars().all(|ch| ch == ' ' || ch == '\t') {
                     SetTextColor(mem_dc, theme.ws_fg);
@@ -806,33 +813,38 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
                 let le = floor_char_boundary(draw_slice, te.min(seg_end_rel) - safe_bs);
                 let p_safe = floor_char_boundary(draw_slice, pos);
                 if ls > p_safe {
-                    draw_chunk(&draw_slice[p_safe..ls], theme.text_fg, state.hfont_regular, false, &mut cur_x, &mut cur_col);
+                    draw_chunk(&draw_slice[p_safe..ls], theme.text_fg, state.hfont_regular, null_mut(), &mut cur_x, &mut cur_col);
                 }
-                let (tcol, tfont, has_bg) = match kind {
-                    TokenKind::Keyword => (theme.kw_fg, state.hfont_regular, false),
-                    TokenKind::Heading1 => (theme.h1_fg, state.hfont_bold, false),
-                    TokenKind::Heading2 => (theme.h2_fg, state.hfont_bold, false),
-                    TokenKind::Heading3 => (theme.h3_fg, state.hfont_bold, false),
-                    TokenKind::StringLit => (theme.str_fg, state.hfont_regular, false),
-                    TokenKind::Comment => (theme.cmt_fg, state.hfont_regular, false),
-                    TokenKind::Number => (theme.num_fg, state.hfont_regular, false),
-                    TokenKind::Accent => (theme.acc_fg, state.hfont_regular, false),
-                    TokenKind::Bold => (theme.bold_fg, state.hfont_bold, false),
-                    TokenKind::Italic => (theme.italic_fg, state.hfont_italic, false),
-                    TokenKind::Strike => (theme.strike_fg, state.hfont_strike, false),
-                    TokenKind::InlineCode => (theme.code_fg, state.hfont_regular, !cached_attr.is_code_block),
-                    TokenKind::AlertTag => (theme.alert_fg, state.hfont_bold, true),
-                    TokenKind::TaskDone => (theme.task_done_fg, state.hfont_bold, false),
-                    TokenKind::TaskTodo => (theme.task_todo_fg, state.hfont_bold, false),
+                let (tcol, tfont, bg_br) = match kind {
+                    TokenKind::Keyword => (theme.kw_fg, state.hfont_regular, null_mut()),
+                    TokenKind::Heading1 => (theme.h1_fg, state.hfont_bold, null_mut()),
+                    TokenKind::Heading2 => (theme.h2_fg, state.hfont_bold, null_mut()),
+                    TokenKind::Heading3 => (theme.h3_fg, state.hfont_bold, null_mut()),
+                    TokenKind::StringLit => (theme.str_fg, state.hfont_regular, null_mut()),
+                    TokenKind::Comment => (theme.cmt_fg, state.hfont_regular, null_mut()),
+                    TokenKind::Number => (theme.num_fg, state.hfont_regular, null_mut()),
+                    TokenKind::Accent => (theme.acc_fg, state.hfont_regular, null_mut()),
+                    TokenKind::Attachment => (theme.attach_fg, state.hfont_bold, attach_br),
+                    TokenKind::Bold => (theme.bold_fg, state.hfont_bold, null_mut()),
+                    TokenKind::Italic => (theme.italic_fg, state.hfont_italic, null_mut()),
+                    TokenKind::Strike => (theme.strike_fg, state.hfont_strike, null_mut()),
+                    TokenKind::InlineCode => (
+                        theme.code_fg,
+                        state.hfont_regular,
+                        if !cached_attr.is_code_block { inline_code_br } else { null_mut() },
+                    ),
+                    TokenKind::AlertTag => (theme.alert_fg, state.hfont_bold, inline_code_br),
+                    TokenKind::TaskDone => (theme.task_done_fg, state.hfont_bold, null_mut()),
+                    TokenKind::TaskTodo => (theme.task_todo_fg, state.hfont_bold, null_mut()),
                 };
                 if le > ls {
-                    draw_chunk(&draw_slice[ls..le], tcol, tfont, has_bg, &mut cur_x, &mut cur_col);
+                    draw_chunk(&draw_slice[ls..le], tcol, tfont, bg_br, &mut cur_x, &mut cur_col);
                 }
                 pos = p_safe.max(le);
             }
             let p_safe = floor_char_boundary(draw_slice, pos);
             if p_safe < draw_slice.len() {
-                draw_chunk(&draw_slice[p_safe..], theme.text_fg, state.hfont_regular, false, &mut cur_x, &mut cur_col);
+                draw_chunk(&draw_slice[p_safe..], theme.text_fg, state.hfont_regular, null_mut(), &mut cur_x, &mut cur_col);
             }
 
             if safe_be == full_line.len() && state.doc.line_folded.get(seg.line).copied().unwrap_or(false) {
@@ -877,6 +889,7 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
         DeleteObject(search_line_br as _);
         DeleteObject(code_blk_br as _);
         DeleteObject(inline_code_br as _);
+        DeleteObject(attach_br as _);
         DeleteObject(quote_bar_br as _);
         DeleteObject(sel_br as _);
         DeleteObject(match_br as _);
