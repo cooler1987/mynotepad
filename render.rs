@@ -630,7 +630,6 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
         let mut cached_attr = LineAttr::default();
 
         let text_left = state.gutter_w + 8 - state.scroll_x;
-        // 即使是大文件，可见行依然保持语法高亮
         let active_lang = state.doc.lang;
 
         for r in 0..vis_rows {
@@ -673,6 +672,7 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
                 FillRect(mem_dc, &q_rc, quote_bar_br);
             }
 
+            let fold_lvl = state.doc.line_levels.get(seg.line).copied().unwrap_or(0);
             if seg.line != last_drawn_logical {
                 if state.cfg.show_line_numbers {
                     SelectObject(mem_dc, state.hfont_regular as _);
@@ -686,7 +686,7 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
                     };
                     DrawTextW(mem_dc, num_s.as_ptr(), (num_s.len() - 1) as i32, &mut nrc, DT_RIGHT | DT_SINGLELINE);
                 }
-                if state.doc.line_levels.get(seg.line).copied().unwrap_or(0) > 0 {
+                if fold_lvl > 0 {
                     let collapsed = state.doc.line_folded.get(seg.line).copied().unwrap_or(false);
                     draw_fold_box(mem_dc, state.gutter_w - FOLD_COL_W + 2, y, state.line_h, collapsed, theme);
                 }
@@ -756,7 +756,6 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
                 }
             }
 
-            // 搜索匹配高亮画在普通选区之上，保证当前命中目标高亮清晰可见
             if state.search.visible && !state.search.matches.is_empty() {
                 let lo = state.search.matches.partition_point(|m| m.1 <= seg_abs_start);
                 for idx in lo..state.search.matches.len() {
@@ -836,11 +835,14 @@ pub fn paint_editor(state: &mut AppState, hdc_win: HDC) {
                 draw_chunk(&draw_slice[p_safe..], theme.text_fg, state.hfont_regular, false, &mut cur_x, &mut cur_col);
             }
 
-            // 折叠标题末尾提示徽标
             if safe_be == full_line.len() && state.doc.line_folded.get(seg.line).copied().unwrap_or(false) {
                 let hidden_cnt = state.doc.folded_descendant_count(seg.line);
                 if hidden_cnt > 0 {
-                    let badge = format!("  ... +{} 行  ", hidden_cnt);
+                    let badge = if fold_lvl == 7 {
+                        format!("  ... 已折叠 {} 行代码  ", hidden_cnt)
+                    } else {
+                        format!("  ... +{} 行  ", hidden_cnt)
+                    };
                     let bw = to_wide(&badge);
                     let blen = (bw.len() - 1) as i32;
                     SelectObject(mem_dc, state.hfont_ui as _);
